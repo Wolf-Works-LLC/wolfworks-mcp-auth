@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 
 import httpx
@@ -31,12 +32,19 @@ INITIALIZE = {
         "clientInfo": {"name": "test", "version": "0"},
     },
 }
-CALL_WHOAMI = {
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "tools/call",
-    "params": {"name": "whoami", "arguments": {}},
-}
+
+
+def _call(tool: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": {}},
+    }
+
+
+CALL_WHOAMI = _call("whoami")
+LIST_TOOLS = {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}
 
 
 class _StubVerifier(TokenVerifier):
@@ -55,22 +63,50 @@ async def _resolver(access: AccessToken) -> dict[str, str]:
 
 
 @contextlib.asynccontextmanager
-async def _client(resolver=_resolver):
-    server = MCPServer(
-        "test",
-        token_verifier=_StubVerifier(),
-        auth=AuthSettings(
+async def _client(resolver=_resolver, *, auth: bool = True, ran: list[str] | None = None):
+    secured = {
+        "token_verifier": _StubVerifier(),
+        "auth": AuthSettings(
             issuer_url="https://issuer.test",
             resource_server_url=RESOURCE,
             required_scopes=["openid"],
             validate_token_resource=True,
         ),
-        middleware=[IdentityGate(resolver)],
-    )
+    }
+    server = MCPServer("test", middleware=[IdentityGate(resolver)], **(secured if auth else {}))
+    arrivals: list[int] = []
+    second_is_past_the_gate, first_has_read = asyncio.Event(), asyncio.Event()
 
     @server.tool()
     def whoami() -> str:
         return current_identity()["user_id"]
+
+    @server.tool()
+    async def whoami_overlapping() -> str:
+        # The first caller reads its identity while the second is past the gate and
+        # still in flight, which is exactly when a shared slot holds the wrong one.
+        arrivals.append(1)
+        if len(arrivals) == 1:
+            await asyncio.wait_for(second_is_past_the_gate.wait(), timeout=5)
+            mine = current_identity()["user_id"]
+            first_has_read.set()
+            return mine
+        second_is_past_the_gate.set()
+        await asyncio.wait_for(first_has_read.wait(), timeout=5)
+        return current_identity()["user_id"]
+
+    @server.tool()
+    def leave_a_mark() -> str:
+        assert ran is not None
+        ran.append("ran")
+        return "done"
+
+    @server.tool()
+    def identity_or_none() -> str:
+        try:
+            return str(current_identity())
+        except LookupError:
+            return "none"
 
     app = server.streamable_http_app(
         streamable_http_path="/mcp",
@@ -132,6 +168,48 @@ async def test_resolved_identity_is_readable_inside_a_tool():
         response = await client.post("/mcp", headers=_auth("good-alice"), json=CALL_WHOAMI)
     assert response.status_code == 200
     assert response.json()["result"]["structuredContent"] == {"result": "row-for-alice"}
+
+
+async def test_refused_identity_never_runs_the_tool():
+    ran: list[str] = []
+    async with _client(ran=ran) as client:
+        refused = await client.post(
+            "/mcp", headers=_auth("good-stranger"), json=_call("leave_a_mark")
+        )
+        allowed = await client.post("/mcp", headers=_auth("good-alice"), json=_call("leave_a_mark"))
+    assert refused.json()["error"]["code"] == IDENTITY_REFUSED_CODE
+    assert "result" in allowed.json()
+    assert ran == ["ran"]  # once, for alice
+
+
+async def test_refusal_covers_methods_other_than_initialize_and_tool_calls():
+    async with _client() as client:
+        response = await client.post("/mcp", headers=_auth("good-stranger"), json=LIST_TOOLS)
+    assert response.json()["error"]["code"] == IDENTITY_REFUSED_CODE
+
+
+async def test_no_bearer_never_reaches_a_tool():
+    ran: list[str] = []
+    async with _client(ran=ran) as client:
+        response = await client.post("/mcp", headers=HEADERS, json=_call("leave_a_mark"))
+    assert response.status_code == 401
+    assert ran == []
+
+
+async def test_without_auth_the_gate_steps_aside_and_publishes_no_identity():
+    async with _client(auth=False) as client:
+        response = await client.post("/mcp", headers=HEADERS, json=_call("identity_or_none"))
+    assert response.json()["result"]["structuredContent"] == {"result": "none"}
+
+
+async def test_overlapping_requests_each_see_their_own_identity():
+    async with _client() as client:
+        alice, bob = await asyncio.gather(
+            client.post("/mcp", headers=_auth("good-alice"), json=_call("whoami_overlapping")),
+            client.post("/mcp", headers=_auth("good-bob"), json=_call("whoami_overlapping")),
+        )
+    assert alice.json()["result"]["structuredContent"] == {"result": "row-for-alice"}
+    assert bob.json()["result"]["structuredContent"] == {"result": "row-for-bob"}
 
 
 async def test_identities_do_not_leak_between_requests():

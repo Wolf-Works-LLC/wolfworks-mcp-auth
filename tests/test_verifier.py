@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+import httpx
 import pytest
 from conftest import ISSUER, RESOURCE, FakeFetcher
 from mcp.server.auth.provider import AccessToken
@@ -77,6 +78,48 @@ async def test_unacceptable_jwt_is_never_offered_to_the_fallback(mint, fetcher):
         return None
 
     assert await _verifier(fetcher, fallback).verify_token(mint(iss="https://evil.test")) is None
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wrong-audience",
+        "wrong-issuer",
+        "expired",
+        "signed-by-another-key",
+        "unknown-kid",
+        "no-kid",
+        "missing-sub",
+        "not-even-a-token",
+        "jwks-unreachable",
+    ],
+)
+async def test_no_failed_jwt_reaches_a_fallback_that_would_accept_it(
+    mint, fetcher, other_key, case
+):
+    # The fallback here says yes to anything, so reaching it at all is the failure.
+    # "Keys are down, try the API-token table" is the tempting regression.
+    seen: list[str] = []
+
+    async def accepts_anything(token: str) -> AccessToken | None:
+        seen.append(token)
+        return api_token_access(token, user_id="intruder", resource=RESOURCE, scopes=["openid"])
+
+    tokens = {
+        "wrong-audience": mint(aud="https://other.test/mcp"),
+        "wrong-issuer": mint(iss="https://evil.test"),
+        "expired": mint(iat=1, exp=2),
+        "signed-by-another-key": mint(key=other_key),
+        "unknown-kid": mint(key=other_key, kid="never-published"),
+        "no-kid": mint(kid=None),
+        "missing-sub": mint(drop=("sub",)),
+        "not-even-a-token": f"{'x' * 30}.{'y' * 30}.{'z' * 30}",
+        "jwks-unreachable": mint(),
+    }
+    if case == "jwks-unreachable":
+        fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("down")
+    assert await _verifier(fetcher, accepts_anything).verify_token(tokens[case]) is None
     assert seen == []
 
 
