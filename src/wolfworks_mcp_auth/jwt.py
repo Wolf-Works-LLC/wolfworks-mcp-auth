@@ -62,6 +62,8 @@ class WorkOSJWTVerifier:
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
+        if isinstance(audiences, str):
+            raise TypeError("audiences is a list of audiences, not one string")
         if not audiences or not all(audiences):
             raise ValueError("at least one non-empty audience is required")
         self._issuer = issuer.rstrip("/")

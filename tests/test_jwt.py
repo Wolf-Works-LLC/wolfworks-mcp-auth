@@ -232,6 +232,12 @@ def test_construction_without_required_configuration_raises(kwargs, message):
         WorkOSJWTVerifier(**kwargs)
 
 
+def test_a_bare_string_is_not_an_audience_list():
+    # `list("client_01ABC")` is an allow-list of single characters, and it type-checks.
+    with pytest.raises(TypeError, match="audiences"):
+        WorkOSJWTVerifier(issuer=ISSUER, audiences="client_01ABC")
+
+
 def test_looks_like_jwt(mint):
     assert looks_like_jwt(mint())
     assert not looks_like_jwt("0123456789abcdef0123456789abcdef")
