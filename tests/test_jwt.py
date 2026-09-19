@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import httpx
@@ -118,6 +119,66 @@ async def test_unknown_kid_refetches_once_for_key_rotation(mint, fetcher, other_
 async def test_unknown_kid_after_refetch_is_rejected(mint, fetcher, other_key):
     with pytest.raises(JWTVerificationError, match="signing key"):
         await _verifier(fetcher).verify(mint(key=other_key, kid="never-published"))
+
+
+async def test_unknown_kids_buy_one_refetch_not_one_each(mint, fetcher, other_key):
+    # Anyone can send an unknown key id, so it must not cost an outbound request every time.
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())  # primes the cache
+    for n in range(5):
+        with pytest.raises(JWTVerificationError, match="signing key"):
+            await verifier.verify(mint(key=other_key, kid=f"bogus-{n}"))
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 2  # the priming fetch, one refetch
+
+
+async def test_concurrent_unknown_kids_share_one_refetch(mint, fetcher, other_key):
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())
+    bogus = [verifier.verify(mint(key=other_key, kid=f"bogus-{n}")) for n in range(20)]
+    results = await asyncio.gather(*bogus, return_exceptions=True)
+    assert all(isinstance(result, JWTVerificationError) for result in results)
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 2
+
+
+async def test_refetch_is_allowed_again_once_the_cooldown_has_passed(
+    mint, fetcher, other_key, make_jwk, monkeypatch
+):
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())
+    with pytest.raises(JWTVerificationError, match="signing key"):
+        await verifier.verify(mint(key=other_key, kid="bogus"))  # spends the refetch
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = {"keys": [make_jwk(other_key, "rotated")]}
+    with pytest.raises(JWTVerificationError, match="signing key"):
+        await verifier.verify(mint(key=other_key, kid="rotated"))  # still cooling down
+    monkeypatch.setattr("wolfworks_mcp_auth.jwt._REFETCH_COOLDOWN_SECONDS", 0)
+    assert (await verifier.verify(mint(key=other_key, kid="rotated")))["sub"] == "user_01ABC"
+
+
+async def test_cached_key_verifies_while_a_refetch_is_in_flight(mint, jwks, other_key):
+    jwks_url = "https://keys.test/jwks"
+    release = asyncio.Event()
+
+    class StallsAfterTheFirstFetch(FakeFetcher):
+        async def __call__(self, url: str):
+            if self.calls:
+                self.calls.append(url)
+                await release.wait()
+            return await super().__call__(url)
+
+    fetcher = StallsAfterTheFirstFetch({jwks_url: jwks})
+    verifier = WorkOSJWTVerifier(
+        issuer=ISSUER, audiences=(RESOURCE,), jwks_url=jwks_url, fetch_json=fetcher
+    )
+    await verifier.verify(mint())
+    stalled = asyncio.create_task(verifier.verify(mint(key=other_key, kid="bogus")))
+    await asyncio.sleep(0)  # let it reach the fetch and hold the lock
+    try:
+        claims = await asyncio.wait_for(verifier.verify(mint()), timeout=1)
+    finally:
+        release.set()
+    assert claims["sub"] == "user_01ABC"
+    with pytest.raises(JWTVerificationError, match="signing key"):
+        await stalled
 
 
 async def test_explicit_jwks_url_skips_discovery(mint, jwks):

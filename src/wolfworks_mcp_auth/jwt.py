@@ -21,6 +21,9 @@ JsonFetcher = Callable[[str], Awaitable[Any]]
 
 _ALGORITHMS = ["RS256"]
 _REQUIRED_CLAIMS = ["exp", "iat", "sub"]
+# Anyone can send a token naming an unknown key id. It buys one refetch per
+# cooldown, not one each; PyJWT's own `PyJWKClient` uses the same 30 seconds.
+_REFETCH_COOLDOWN_SECONDS = 30
 
 
 class JWTVerificationError(Exception):
@@ -69,6 +72,7 @@ class WorkOSJWTVerifier:
         self._fetch_json = fetch_json
         self._keys: dict[str, PyJWK] = {}
         self._keys_fetched_at = 0.0
+        self._refetched_at = float("-inf")
         self._lock = asyncio.Lock()
 
     async def verify(self, token: str) -> dict[str, Any]:
@@ -109,11 +113,23 @@ class WorkOSJWTVerifier:
             raise JWTVerificationError(f"no signing key published for kid {kid!r}")
         return keys[kid]
 
+    def _cache_answers(self, *, force: bool) -> bool:
+        if not self._keys:
+            return False
+        if force:
+            return (time.monotonic() - self._refetched_at) < _REFETCH_COOLDOWN_SECONDS
+        return (time.monotonic() - self._keys_fetched_at) < self._ttl
+
     async def _load_keys(self, *, force: bool) -> dict[str, PyJWK]:
+        # Checked before the lock so a fetch in flight never stalls a cache hit,
+        # and again inside it because the request ahead may have just fetched.
+        if self._cache_answers(force=force):
+            return self._keys
         async with self._lock:
-            fresh = (time.monotonic() - self._keys_fetched_at) < self._ttl
-            if self._keys and fresh and not force:
+            if self._cache_answers(force=force):
                 return self._keys
+            if force:
+                self._refetched_at = time.monotonic()
             try:
                 url = self._jwks_url or await self._discover_jwks_url()
                 key_set = PyJWKSet.from_dict(await self._fetch_json(url))
