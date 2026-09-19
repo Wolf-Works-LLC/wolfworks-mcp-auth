@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 
 import httpx
 import pytest
@@ -57,6 +58,22 @@ async def test_rejects_token_issued_in_the_future(mint, fetcher):
     future = int(time.time()) + 7200
     with pytest.raises(JWTVerificationError):
         await _verifier(fetcher).verify(mint(iat=future, exp=future + 60))
+
+
+async def test_leeway_is_a_minute_and_no_more(mint, fetcher):
+    now, verifier = int(time.time()), _verifier(fetcher)
+    await verifier.verify(mint(iat=now - 3600, exp=now - 30))
+    await verifier.verify(mint(iat=now + 30))
+    with pytest.raises(JWTVerificationError, match="expired"):
+        await verifier.verify(mint(iat=now - 3600, exp=now - 120))
+    with pytest.raises(JWTVerificationError, match="iat"):
+        await verifier.verify(mint(iat=now + 120))
+
+
+async def test_rejects_token_without_a_kid(mint, fetcher):
+    # One published key is no reason to guess: a token names its key or is refused.
+    with pytest.raises(JWTVerificationError, match="signing key"):
+        await _verifier(fetcher).verify(mint(kid=None))
 
 
 @pytest.mark.parametrize("claim", ["exp", "iat", "sub"])
@@ -136,6 +153,47 @@ async def test_jwks_is_cached_between_verifications(mint, fetcher):
     assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 1
 
 
+async def test_key_withdrawn_by_the_issuer_stops_being_trusted_after_the_ttl(
+    mint, fetcher, other_key, make_jwk, monkeypatch
+):
+    clock = [1000.0]
+    # Only the package's view of the clock: the event loop reads `time.monotonic` too.
+    fake_time = types.SimpleNamespace(monotonic=lambda: clock[0])
+    monkeypatch.setattr("wolfworks_mcp_auth.jwt.time", fake_time)
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = {"keys": [make_jwk(other_key, "its-successor")]}
+    clock[0] += 299
+    await verifier.verify(mint())  # within the five minutes, still served from the cache
+    clock[0] += 2
+    with pytest.raises(JWTVerificationError, match="signing key"):
+        await verifier.verify(mint())
+
+
+async def test_default_fetcher_sets_a_timeout_and_refuses_an_error_status(mint, jwks, monkeypatch):
+    real_client, options = httpx.AsyncClient, {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # The 503 carries a usable key set, so only `raise_for_status()` can refuse it.
+        return httpx.Response(200 if request.url.path == "/jwks" else 503, json=jwks)
+
+    def client(**kwargs):
+        options.update(kwargs)
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("wolfworks_mcp_auth.jwt.httpx.AsyncClient", client)
+
+    def verifier(path: str) -> WorkOSJWTVerifier:
+        return WorkOSJWTVerifier(
+            issuer=ISSUER, audiences=(RESOURCE,), jwks_url=f"https://keys.test{path}"
+        )
+
+    assert (await verifier("/jwks").verify(mint()))["sub"] == "user_01ABC"
+    assert options["timeout"] == 5
+    with pytest.raises(JWTVerificationError, match="JWKS unavailable"):
+        await verifier("/down").verify(mint())
+
+
 async def test_unknown_kid_refetches_once_for_key_rotation(mint, fetcher, other_key, make_jwk):
     verifier = _verifier(fetcher)
     await verifier.verify(mint())  # primes the cache with the old key set
@@ -160,7 +218,24 @@ async def test_unknown_kids_buy_one_refetch_not_one_each(mint, fetcher, other_ke
     assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 2  # the priming fetch, one refetch
 
 
+class YieldingFetcher(FakeFetcher):
+    """Gives way as a real request would, so concurrent callers really do queue up."""
+
+    async def __call__(self, url: str):
+        await asyncio.sleep(0)
+        return await super().__call__(url)
+
+
+async def test_concurrent_cold_verifications_fetch_the_jwks_once(mint, fetcher):
+    fetcher = YieldingFetcher(fetcher.documents)
+    verifier = _verifier(fetcher)
+    results = await asyncio.gather(*(verifier.verify(mint()) for _ in range(10)))
+    assert all(claims["sub"] == "user_01ABC" for claims in results)
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 1
+
+
 async def test_concurrent_unknown_kids_share_one_refetch(mint, fetcher, other_key):
+    fetcher = YieldingFetcher(fetcher.documents)
     verifier = _verifier(fetcher)
     await verifier.verify(mint())
     bogus = [verifier.verify(mint(key=other_key, kid=f"bogus-{n}")) for n in range(20)]
