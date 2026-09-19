@@ -31,6 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          tar --exclude=.git -czf /tmp/pkg.tar.gz -C .. "$(basename "$PWD")"
-          docker run --rm -v /tmp/pkg.tar.gz:/pkg.tar.gz python:3.12-slim \
-            sh -c 'pip install --quiet "wolfworks-mcp-auth @ file:///pkg.tar.gz" && python -c "import wolfworks_mcp_auth; print(wolfworks_mcp_auth.__all__)"'
+          # Same shape as a GitHub tag archive: one top-level directory, no .git.
+          git archive --format=tar.gz --prefix=wolfworks-mcp-auth/ -o /tmp/pkg.tar.gz HEAD
+          docker run --rm -i python:3.12-slim sh -c \
+            'cat > /pkg.tar.gz && ! command -v git && pip install --quiet "wolfworks-mcp-auth @ file:///pkg.tar.gz" && python -c "import wolfworks_mcp_auth; print(wolfworks_mcp_auth.__all__)"' \
+            < /tmp/pkg.tar.gz
