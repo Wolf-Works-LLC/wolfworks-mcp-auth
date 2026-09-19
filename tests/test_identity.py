@@ -10,6 +10,7 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import MCPError
 
 from wolfworks_mcp_auth import (
     IDENTITY_REFUSED_CODE,
@@ -54,7 +55,7 @@ async def _resolver(access: AccessToken) -> dict[str, str]:
 
 
 @contextlib.asynccontextmanager
-async def _client():
+async def _client(resolver=_resolver):
     server = MCPServer(
         "test",
         token_verifier=_StubVerifier(),
@@ -64,7 +65,7 @@ async def _client():
             required_scopes=["openid"],
             validate_token_resource=True,
         ),
-        middleware=[IdentityGate(_resolver)],
+        middleware=[IdentityGate(resolver)],
     )
 
     @server.tool()
@@ -97,6 +98,33 @@ async def test_refusal_is_a_jsonrpc_error_with_no_challenge(body):
     assert error["code"] == IDENTITY_REFUSED_CODE == -31403
     assert error["message"] == "Sign in at https://server.test once, then reconnect."
     assert error["data"] == {"reason": "identity_refused"}
+
+
+async def test_resolver_failure_tells_the_client_nothing(caplog):
+    # The SDK sends an unexpected exception's text to the client, and a failed
+    # lookup can name anything: a connection string, another user's address.
+    async def broken(access: AccessToken) -> None:
+        raise RuntimeError("could not connect to postgres://app:hunter2@db.internal/prod")
+
+    async with _client(broken) as client:
+        response = await client.post("/mcp", headers=_auth("good-alice"), json=CALL_WHOAMI)
+    assert response.status_code == 200
+    assert "hunter2" not in response.text
+    assert response.json()["error"] == {"code": -32603, "message": "Internal server error"}
+    assert "hunter2" in caplog.text  # the operator still gets it
+
+
+async def test_resolver_may_raise_its_own_mcp_error():
+    async def suspended(access: AccessToken) -> None:
+        raise MCPError(-31402, "Subscription lapsed.", {"reason": "payment_required"})
+
+    async with _client(suspended) as client:
+        response = await client.post("/mcp", headers=_auth("good-alice"), json=CALL_WHOAMI)
+    assert response.json()["error"] == {
+        "code": -31402,
+        "message": "Subscription lapsed.",
+        "data": {"reason": "payment_required"},
+    }
 
 
 async def test_resolved_identity_is_readable_inside_a_tool():
