@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from conftest import ISSUER, RESOURCE, FakeFetcher
 from mcp.server.auth.provider import AccessToken
@@ -41,6 +43,13 @@ async def test_client_id_falls_back_to_azp_then_sub(mint, fetcher):
 async def test_array_audience_reports_this_server_as_the_resource(mint, fetcher):
     access = await _verifier(fetcher).verify_token(mint(aud=["https://other.test/mcp", RESOURCE]))
     assert access.resource == RESOURCE
+
+
+async def test_fractional_exp_is_accepted_as_whole_seconds(mint, fetcher):
+    # RFC 7519 allows a non-integer NumericDate; `AccessToken.expires_at` is an int.
+    exp = time.time() + 3600.5
+    access = await _verifier(fetcher).verify_token(mint(exp=exp))
+    assert access.expires_at == int(exp)
 
 
 async def test_token_without_scope_claim_has_no_scopes(mint, fetcher):

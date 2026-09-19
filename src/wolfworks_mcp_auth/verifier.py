@@ -79,7 +79,7 @@ class WorkOSTokenVerifier(TokenVerifier):
             token=token,
             client_id=str(claims.get("client_id") or claims.get("azp") or claims["sub"]),
             scopes=str(claims.get("scope") or "").split(),
-            expires_at=claims["exp"],
+            expires_at=int(claims["exp"]),  # a NumericDate may carry a fraction
             # `aud` may be a list; the verifier has already proved this server is in it.
             resource=self._resource,
             subject=str(claims["sub"]),
