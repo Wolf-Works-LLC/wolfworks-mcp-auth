@@ -1,4 +1,4 @@
-"""AC-13 and FR-4: the package names no host and imports no consumer."""
+"""AC-13 and FR-4: the package names no host and imports no consumer, and ships its types."""
 
 from __future__ import annotations
 
@@ -49,3 +49,8 @@ def test_package_imports_no_consuming_application():
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
     assert not (imported & CONSUMERS), imported & CONSUMERS
+
+
+def test_package_ships_the_typing_marker():
+    # Without it a consumer's type checker treats every annotation here as `Any`.
+    assert (SOURCE / "py.typed").is_file()

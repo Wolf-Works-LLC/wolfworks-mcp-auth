@@ -96,6 +96,13 @@ async def test_non_jwt_bearer_resolves_through_the_fallback(fetcher):
     assert fetcher.calls == []  # an API token never triggers a JWKS fetch
 
 
+def test_api_token_access_takes_an_integer_primary_key():
+    # `AccessToken.subject` is a string; an application's primary key need not be.
+    access = api_token_access(API_TOKEN, user_id=42, resource=RESOURCE, scopes=["openid"])
+    assert access.subject == "42"
+    assert access.client_id == "api-token:42"
+
+
 async def test_unrecognised_non_jwt_bearer_returns_none(fetcher):
     async def fallback(token: str) -> AccessToken | None:
         return None

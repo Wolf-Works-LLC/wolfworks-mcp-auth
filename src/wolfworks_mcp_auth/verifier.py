@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 FallbackResolver = Callable[[str], Awaitable[AccessToken | None]]
 
 
-def api_token_access(token: str, *, user_id: str, resource: str, scopes: list[str]) -> AccessToken:
+def api_token_access(
+    token: str, *, user_id: str | int, resource: str, scopes: list[str]
+) -> AccessToken:
     """Build the `AccessToken` a fallback resolver returns for an opaque API token.
 
     Every field is load-bearing. The SDK rejects a token whose `resource` is not
@@ -35,7 +37,7 @@ def api_token_access(token: str, *, user_id: str, resource: str, scopes: list[st
         client_id=f"api-token:{user_id}",
         scopes=scopes,
         resource=resource,
-        subject=user_id,
+        subject=str(user_id),
     )
 
 
