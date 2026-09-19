@@ -79,8 +79,15 @@ async def test_rejects_symmetric_algorithm(fetcher):
         algorithm="HS256",
         headers={"kid": KID},
     )
-    with pytest.raises(JWTVerificationError):
+    # `match` matters: with HS256 allowed the token still fails, on the key's type.
+    with pytest.raises(JWTVerificationError, match="alg value is not allowed"):
         await _verifier(fetcher).verify(forged)
+
+
+@pytest.mark.parametrize("algorithm", ["RS384", "RS512", "PS256"])
+async def test_rejects_other_rsa_algorithms(mint, fetcher, algorithm):
+    with pytest.raises(JWTVerificationError, match="alg value is not allowed"):
+        await _verifier(fetcher).verify(mint(algorithm=algorithm))
 
 
 async def test_rejects_garbage(fetcher):
@@ -94,10 +101,32 @@ async def test_jwks_http_error_raises_verification_error(mint, fetcher):
         await _verifier(fetcher).verify(mint())
 
 
-async def test_jwks_garbage_json_raises_verification_error(mint, fetcher):
-    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = {"not": "a key set"}
+@pytest.mark.parametrize(
+    "document",
+    [{"not": "a key set"}, [], None, "an error page", {"keys": [1]}],
+    ids=["no-keys", "list", "null", "string", "key-is-not-an-object"],
+)
+async def test_jwks_garbage_json_raises_verification_error(mint, fetcher, document):
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = document
     with pytest.raises(JWTVerificationError, match="JWKS unavailable"):
         await _verifier(fetcher).verify(mint())
+
+
+async def test_jwks_key_with_an_unhashable_kid_raises_verification_error(
+    mint, fetcher, signing_key, make_jwk
+):
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = {
+        "keys": [make_jwk(signing_key, ["not", "a", "str"])]
+    }
+    with pytest.raises(JWTVerificationError, match="JWKS unavailable"):
+        await _verifier(fetcher).verify(mint())
+
+
+@pytest.mark.parametrize("exp", [[1], {"a": 1}, float("inf")], ids=["list", "object", "infinity"])
+async def test_signed_token_with_an_unusable_exp_raises_verification_error(mint, fetcher, exp):
+    # The SDK turns anything else a verifier raises into a 500.
+    with pytest.raises(JWTVerificationError):
+        await _verifier(fetcher).verify(mint(exp=exp))
 
 
 async def test_jwks_is_cached_between_verifications(mint, fetcher):

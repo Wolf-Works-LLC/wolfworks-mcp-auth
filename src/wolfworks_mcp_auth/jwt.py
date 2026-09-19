@@ -77,9 +77,12 @@ class WorkOSJWTVerifier:
 
     async def verify(self, token: str) -> dict[str, Any]:
         """Return the token's claims, or raise `JWTVerificationError`."""
+        # The excepts below end in `Exception` because the SDK turns anything a
+        # verifier raises into a 500, and the token, its claims and the JWKS are
+        # all somebody else's input.
         try:
             kid = jwt.get_unverified_header(token).get("kid")
-        except jwt.PyJWTError as exc:
+        except Exception as exc:
             raise JWTVerificationError(f"malformed token: {exc}") from exc
 
         key = await self._signing_key(kid)
@@ -101,7 +104,7 @@ class WorkOSJWTVerifier:
             raise JWTVerificationError(f"audience or required claim rejected: {exc}") from exc
         except jwt.InvalidSignatureError as exc:
             raise JWTVerificationError("signature verification failed") from exc
-        except jwt.PyJWTError as exc:
+        except Exception as exc:
             raise JWTVerificationError(f"token rejected: {exc}") from exc
 
     async def _signing_key(self, kid: str | None) -> PyJWK:
@@ -133,9 +136,10 @@ class WorkOSJWTVerifier:
             try:
                 url = self._jwks_url or await self._discover_jwks_url()
                 key_set = PyJWKSet.from_dict(await self._fetch_json(url))
-            except (httpx.HTTPError, jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+                keys = {key.key_id: key for key in key_set.keys if key.key_id}
+            except Exception as exc:
                 raise JWTVerificationError(f"JWKS unavailable: {exc}") from exc
-            self._keys = {key.key_id: key for key in key_set.keys if key.key_id}
+            self._keys = keys
             self._keys_fetched_at = time.monotonic()
             return self._keys
 
