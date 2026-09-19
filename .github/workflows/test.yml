@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest
+
+  installs-from-an-archive-without-git:
+    # Consumers' images are python:slim and have no git, so the documented
+    # install form has to work from a plain tarball.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tar --exclude=.git -czf /tmp/pkg.tar.gz -C .. "$(basename "$PWD")"
+          docker run --rm -v /tmp/pkg.tar.gz:/pkg.tar.gz python:3.12-slim \
+            sh -c 'pip install --quiet "wolfworks-mcp-auth @ file:///pkg.tar.gz" && python -c "import wolfworks_mcp_auth; print(wolfworks_mcp_auth.__all__)"'
