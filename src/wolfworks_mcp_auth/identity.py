@@ -8,6 +8,7 @@ a token has been accepted: HTTP 200 with a JSON-RPC error and no challenge.
 from __future__ import annotations
 
 import contextvars
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -15,6 +16,9 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.shared.exceptions import MCPError
+from mcp.types import INTERNAL_ERROR
+
+logger = logging.getLogger(__name__)
 
 # MCP 2026-07-28 reserves -32768..-32000 for JSON-RPC and the specification, and
 # says application-defined codes belong outside it.
@@ -54,6 +58,13 @@ class IdentityGate:
             identity = await self._resolver(access)
         except IdentityRefused as exc:
             raise MCPError(IDENTITY_REFUSED_CODE, str(exc), {"reason": "identity_refused"}) from exc
+        except MCPError:
+            raise
+        except Exception:
+            # The SDK would put this exception's text in the response, and a failed
+            # lookup can name anything. Tool errors are already sealed the same way.
+            logger.exception("identity resolver failed")
+            raise MCPError(INTERNAL_ERROR, "Internal server error") from None
         reset = _identity.set(identity)
         try:
             return await call_next(ctx)
