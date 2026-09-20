@@ -4,10 +4,11 @@
 
 Three hops: the unauthenticated challenge, the protected resource metadata it
 points at, and the authorization server metadata that names. Exit status is 0
-when the challenge is a direct 401 carrying `resource_metadata`, both documents
-answer 200, and neither the challenge nor `scopes_supported` advertises
-`offline_access`. It does not read the documents further: a `resource` or an
-`issuer` that a client would refuse still passes.
+when the challenge is a direct 401 carrying `resource_metadata`; that document
+answers 200, describes exactly the URL probed and names an authorization server;
+that server's metadata answers 200 with exactly that `issuer`; and neither the
+challenge nor `scopes_supported` advertises `offline_access`. It checks
+discovery, not a token exchange.
 """
 
 from __future__ import annotations
@@ -71,7 +72,15 @@ async def probe(url: str, *, client: httpx.AsyncClient | None = None) -> ProbeRe
             await asyncio.wait_for(_walk(url, client, report), _DEADLINE_SECONDS)
     except TimeoutError:
         report.failures.append(f"no answer within the {_DEADLINE_SECONDS:g}s deadline")
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+    except (
+        httpx.HTTPError,
+        httpx.InvalidURL,  # not an HTTPError: a `resource_metadata` that is no URL at all
+        ValueError,
+        TypeError,
+        AttributeError,
+        LookupError,
+        RecursionError,
+    ) as exc:
         # A hop that is unreachable, or answers 200 with something other than the
         # JSON object the specification requires, is a finding - not a traceback.
         report.failures.append(f"could not read a hop: {exc!r}")
@@ -121,9 +130,10 @@ async def _walk(url: str, client: httpx.AsyncClient, report: ProbeReport) -> Non
         response = await client.get(candidate, follow_redirects=False)
         if response.status_code == 200:
             report.hops.append((candidate, 200))
-            if response.json().get("issuer") != issuer:
+            published = response.json().get("issuer")
+            if published != issuer:
                 # RFC 8414 s3.3: the strings must be identical, trailing slash included.
-                report.failures.append(f"{candidate} is not the metadata of {issuer!r}")
+                report.failures.append(f"{candidate} publishes {published!r}, not {issuer!r}")
             return
     report.hops.append((candidate, response.status_code))
     report.failures.append(f"authorization server {issuer} serves no metadata document")

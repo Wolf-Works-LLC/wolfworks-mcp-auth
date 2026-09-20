@@ -21,7 +21,7 @@ AS_METADATA = f"{ISSUER}/.well-known/oauth-authorization-server"
 CHALLENGE = f'Bearer error="invalid_token", error_description="x", resource_metadata="{PRM}"'
 
 
-def _client(**overrides) -> httpx.AsyncClient:
+def _handler(**overrides):
     """A fake deployment. Each keyword replaces the response for one hop."""
     responses = {
         SERVER: httpx.Response(401, headers={"WWW-Authenticate": CHALLENGE}),
@@ -40,7 +40,11 @@ def _client(**overrides) -> httpx.AsyncClient:
     def handler(request: httpx.Request) -> httpx.Response:
         return responses.get(str(request.url), httpx.Response(404))
 
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return handler
+
+
+def _client(**overrides) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(_handler(**overrides)))
 
 
 async def test_conformant_server_passes():
@@ -173,12 +177,14 @@ def test_report_serialises():
     assert json.loads(report.to_json()) == {"ok": True, "hops": [[SERVER, 401]], "failures": []}
 
 
-async def test_resource_metadata_describing_another_resource_fails():
-    body = {"resource": "https://elsewhere.test/mcp", "authorization_servers": [ISSUER]}
+@pytest.mark.parametrize("resource", ["https://elsewhere.test/mcp", SERVER + "/"])
+async def test_resource_metadata_describing_another_resource_fails(resource):
+    # A trailing slash counts here too: RFC 9728 s3.3 has the client compare the strings.
+    body = {"resource": resource, "authorization_servers": [ISSUER]}
     async with _client(**{PRM: httpx.Response(200, json=body)}) as client:
         report = await probe(SERVER, client=client)
     assert not report.ok
-    assert "https://elsewhere.test/mcp" in report.failures[0]
+    assert repr(resource) in report.failures[0]
 
 
 @pytest.mark.parametrize("issuer", ["https://someone-else.test", ISSUER + "/"])
@@ -187,7 +193,7 @@ async def test_authorization_server_metadata_for_another_issuer_fails(issuer):
     async with _client(**{AS_METADATA: httpx.Response(200, json={"issuer": issuer})}) as client:
         report = await probe(SERVER, client=client)
     assert not report.ok
-    assert ISSUER in report.failures[0]
+    assert repr(issuer) in report.failures[0] and repr(ISSUER) in report.failures[0]
 
 
 @pytest.mark.parametrize("hop", [PRM, AS_METADATA])
@@ -197,6 +203,29 @@ async def test_metadata_that_is_not_a_json_object_is_a_failure_not_a_traceback(h
             report = await probe(SERVER, client=client)
         assert not report.ok
         assert report.failures
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            SERVER: httpx.Response(
+                401, headers={"WWW-Authenticate": CHALLENGE.replace(PRM, "https://[::1/x")}
+            )
+        },
+        {
+            PRM: httpx.Response(
+                200, json={"resource": SERVER, "authorization_servers": {"a": ISSUER}}
+            )
+        },
+    ],
+    ids=["metadata-url-is-no-url", "servers-is-an-object"],
+)
+async def test_a_malformed_url_or_server_list_is_a_failure_not_a_traceback(overrides):
+    async with _client(**overrides) as client:
+        report = await probe(SERVER, client=client)
+    assert not report.ok
+    assert "could not read a hop" in report.failures[0]
 
 
 async def test_unreachable_server_is_a_failure_not_a_traceback():
@@ -220,6 +249,29 @@ async def test_a_server_that_never_answers_meets_the_deadline(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.MockTransport(stall)) as client:
         report = await probe(SERVER, client=client)
     assert not report.ok
+    assert "deadline" in report.failures[0]
+
+
+async def test_without_a_client_the_probe_builds_one_and_holds_it_to_the_deadline(monkeypatch):
+    # The command line takes this branch and no other.
+    import asyncio
+
+    async def stall(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(401)
+
+    real_client, handlers = httpx.AsyncClient, [_handler()]
+
+    def owned(**kwargs):
+        return real_client(transport=httpx.MockTransport(handlers[0]), **kwargs)
+
+    monkeypatch.setattr("wolfworks_mcp_auth.conformance.httpx.AsyncClient", owned)
+    report = await probe(SERVER)
+    assert report.ok, report.failures
+
+    handlers[0] = stall
+    monkeypatch.setattr("wolfworks_mcp_auth.conformance._DEADLINE_SECONDS", 0.05)
+    report = await probe(SERVER)
     assert "deadline" in report.failures[0]
 
 
