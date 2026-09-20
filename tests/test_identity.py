@@ -215,6 +215,17 @@ async def test_the_gate_steps_aside_only_when_told_to_and_publishes_no_identity(
     assert response.json()["result"]["structuredContent"] == {"result": "none"}
 
 
+async def test_the_opt_out_does_not_switch_the_resolver_off_for_a_verified_token():
+    # The flag left on in production must cost nothing: it covers a missing token only.
+    ran: list[str] = []
+    async with _client(allow_unauthenticated=True, ran=ran) as client:
+        response = await client.post(
+            "/mcp", headers=_auth("good-stranger"), json=_call("leave_a_mark")
+        )
+    assert response.json()["error"]["code"] == IDENTITY_REFUSED_CODE
+    assert ran == []
+
+
 async def test_overlapping_requests_each_see_their_own_identity():
     async with _client() as client:
         alice, bob = await asyncio.gather(
