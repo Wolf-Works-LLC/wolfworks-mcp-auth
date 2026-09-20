@@ -14,7 +14,9 @@ dependencies = [
     # IdentityGate implements ServerMiddleware, which the SDK marks provisional and
     # free to change in a 2.x minor release. Raise the ceiling deliberately, with CI green.
     "mcp>=2.2.0,<2.3",
-    "PyJWT[crypto]>=2.10.1",
+    # The first release this suite passes on: earlier ones accept a token whose `crit`
+    # header names an extension nobody here understands (RFC 7515 s4.1.11).
+    "PyJWT[crypto]>=2.12.0",
     "httpx>=0.27",
 ]
 
