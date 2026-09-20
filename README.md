@@ -19,11 +19,15 @@ It names no host. Every URL is configuration you pass in.
 
 ## Install
 
-There is no package index. Pin the tag archive — it needs no `git` in the image:
+There is no package index. Pin the wheel attached to a release:
 
 ```
-wolfworks-mcp-auth @ https://github.com/Wolf-Works-LLC/wolfworks-mcp-auth/archive/refs/tags/v0.1.0.tar.gz
+wolfworks-mcp-auth @ https://github.com/Wolf-Works-LLC/wolfworks-mcp-auth/releases/download/v0.1.0/wolfworks_mcp_auth-0.1.0-py3-none-any.whl
 ```
+
+It needs no `git` and no build backend in your image, and unlike the archive
+GitHub generates from a tag, a release asset's bytes never change — which a
+hash-pinning lock file depends on.
 
 A project built with hatchling refuses a URL dependency until its own
 `pyproject.toml` allows one:
@@ -175,8 +179,33 @@ Anything else your resolver raises is logged and answered with `-32603`
 "Internal server error". Left alone, the SDK would send the exception's own text
 to the client. An `MCPError` you raise on purpose passes through unchanged.
 
-`current_identity()` raises `LookupError` when nothing was resolved: outside a
-request, or on a server running without auth, where the gate steps aside.
+`current_identity()` raises `LookupError` when nothing was resolved.
+
+**The gate fails closed.** A request reaches it without a verified token only
+when the server was built without `auth=` and `token_verifier=`. It answers that
+with `-32603` and logs why, so a server that merely forgot its auth settings runs
+no tool for anyone. To run without auth on purpose, in local development, say so:
+`IdentityGate(resolve, allow_unauthenticated=True)`.
+
+## When the issuer is down
+
+Signing keys are cached for five minutes. If a refresh fails, the verifier keeps
+serving the keys it holds — they are public, and the issuer published them — and
+tries again after thirty seconds rather than once per request. It stops doing so
+when those keys are a day old (`max_stale_seconds`), and with no keys at all it
+refuses every JWT. API tokens never touch the JWKS and are unaffected.
+
+## What the probe checks
+
+`python -m wolfworks_mcp_auth.conformance <url>` fails unless: the endpoint answers
+an unauthenticated `POST` with `401` directly (a redirect fails — clients drop
+`Authorization` across one) and a `Bearer` challenge carrying `resource_metadata`;
+that document is a JSON object whose `resource` is exactly the URL probed and
+which names an authorization server; that server's RFC 8414 or OpenID metadata is
+a JSON object whose `issuer` is exactly that string; and `offline_access` appears
+in neither the challenge nor the resource's `scopes_supported`. Anything
+unreachable, malformed or slower than sixty seconds is reported as a failure, not
+a traceback. It checks discovery, not a token exchange.
 
 ## Development
 

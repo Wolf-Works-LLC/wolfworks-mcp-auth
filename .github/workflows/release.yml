@@ -1,0 +1,33 @@
+name: release
+
+# Consumers pin the wheel attached to a release, not the archive GitHub generates
+# from the tag: a release asset's bytes never change, and lock files hash them.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The tag is the version
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != pyproject version $version"; exit 1; }
+      - run: pip install build
+      - run: python -m build
+      - name: The wheel installs where consumers install it
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" python:3.12-slim sh -c \
+            '! command -v git && pip install --quiet /dist/*.whl && python -c "import wolfworks_mcp_auth, mcp; print(wolfworks_mcp_auth.__all__)"'
+      - name: Attach the wheel and sdist to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
