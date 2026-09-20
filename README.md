@@ -1,7 +1,11 @@
 # wolfworks-mcp-auth
 
 WorkOS token verification and an identity gate for MCP servers built on the
-official [`mcp`](https://pypi.org/project/mcp/) Python SDK, version 2.2.0 or later.
+official [`mcp`](https://pypi.org/project/mcp/) Python SDK, version 2.2
+(`mcp>=2.2.0,<2.3`). The ceiling is deliberate: `IdentityGate` implements
+`ServerMiddleware`, which the SDK marks provisional and free to change in a 2.x
+minor release. A project that requires `mcp>=2.3` will not resolve until this
+package raises it.
 
 **The SDK owns the protocol. This package owns WorkOS. Your application owns its identity.**
 
@@ -185,15 +189,19 @@ to the client. An `MCPError` you raise on purpose passes through unchanged.
 when the server was built without `auth=` and `token_verifier=`. It answers that
 with `-32603` and logs why, so a server that merely forgot its auth settings runs
 no tool for anyone. To run without auth on purpose, in local development, say so:
-`IdentityGate(resolve, allow_unauthenticated=True)`.
+`IdentityGate(resolve, allow_unauthenticated=True)`. Nothing is resolved in that
+mode, so `current_identity()` raises `LookupError` in every tool. A request that
+does carry a verified token still goes through your resolver.
 
 ## When the issuer is down
 
 Signing keys are cached for five minutes. If a refresh fails, the verifier keeps
 serving the keys it holds — they are public, and the issuer published them — and
 tries again after thirty seconds rather than once per request. It stops doing so
-when those keys are a day old (`max_stale_seconds`), and with no keys at all it
-refuses every JWT. API tokens never touch the JWKS and are unaffected.
+a day after the last successful fetch, and with no keys at all it refuses every
+JWT; either is logged as an error. `WorkOSJWTVerifier` takes `max_stale_seconds`
+to change the day; `WorkOSTokenVerifier` uses the default. API tokens never touch
+the JWKS and are unaffected.
 
 ## What the probe checks
 
