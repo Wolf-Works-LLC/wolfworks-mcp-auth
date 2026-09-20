@@ -5,8 +5,9 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # The SDK API this package implements is provisional; hear about a break on a
-    # Monday rather than during someone's deploy.
+    # Three consumers deploy without a lock file, so they install the newest PyJWT,
+    # httpx and mcp 2.2.x there is: hear that one broke this on a Monday rather than
+    # during a deploy. It cannot see mcp 2.3; pyproject's ceiling excludes it.
     - cron: "17 6 * * 1"
 
 permissions:
@@ -28,15 +29,17 @@ jobs:
       - run: ruff format --check .
       - run: pytest
 
-  installs-from-an-archive-without-git:
-    # Consumers' images are python:slim and have no git, so the documented
-    # install form has to work from a plain tarball.
+  wheel-installs-without-git:
+    # Consumers' images are python:slim and have no git, and what they pin is the
+    # wheel: build it as the release does and install it there, before a tag exists.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
       - run: |
-          # Same shape as a GitHub tag archive: one top-level directory, no .git.
-          git archive --format=tar.gz --prefix=wolfworks-mcp-auth/ -o /tmp/pkg.tar.gz HEAD
-          docker run --rm -i python:3.12-slim sh -c \
-            'cat > /pkg.tar.gz && ! command -v git && pip install --quiet "wolfworks-mcp-auth @ file:///pkg.tar.gz" && python -c "import wolfworks_mcp_auth; print(wolfworks_mcp_auth.__all__)"' \
-            < /tmp/pkg.tar.gz
+          docker run --rm -v "$PWD/dist:/dist:ro" python:3.12-slim sh -c \
+            '! command -v git && pip install --quiet /dist/*.whl && python -c "import wolfworks_mcp_auth, mcp; print(wolfworks_mcp_auth.__all__)"'
