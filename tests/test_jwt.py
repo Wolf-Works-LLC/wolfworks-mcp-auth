@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import types
 
@@ -386,6 +387,18 @@ async def test_with_no_keys_held_a_failed_fetch_backs_off_and_still_fails_closed
         with pytest.raises(JWTVerificationError, match="JWKS unavailable"):
             await verifier.verify(mint())
     assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 1
+
+
+async def test_an_outage_that_refuses_every_token_is_an_error_naming_the_exception(
+    mint, fetcher, caplog
+):
+    # `str(httpx.ReadTimeout(""))` is empty: without the type, the operator is told nothing.
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ReadTimeout("")
+    with pytest.raises(JWTVerificationError, match="ReadTimeout"):
+        await _verifier(fetcher).verify(mint())
+    errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "ReadTimeout" in errors[0].getMessage()
 
 
 async def test_error_text_is_one_bounded_line(fetcher, signing_key):

@@ -161,8 +161,13 @@ class WorkOSJWTVerifier:
                 keys = {key.key_id: key for key in key_set.keys if key.key_id}
             except Exception as exc:
                 self._failed_at = time.monotonic()
-                held = self._held_keys_or_raise(str(exc), cause=exc)
-                logger.warning("JWKS refresh failed, serving the cached keys: %s", exc)
+                # `repr`, because a timeout's text is empty and its type is the whole reason.
+                try:
+                    held = self._held_keys_or_raise(repr(exc), cause=exc)
+                except JWTVerificationError:
+                    logger.error("JWKS refresh failed with no usable keys, refusing JWTs: %r", exc)
+                    raise
+                logger.warning("JWKS refresh failed, serving the cached keys: %r", exc)
                 return held
             self._keys = keys
             self._keys_fetched_at = time.monotonic()
