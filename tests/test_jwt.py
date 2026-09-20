@@ -389,6 +389,21 @@ async def test_with_no_keys_held_a_failed_fetch_backs_off_and_still_fails_closed
     assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 1
 
 
+async def test_a_jwks_with_no_key_id_is_a_failed_fetch_and_the_held_keys_stay(
+    mint, fetcher, signing_key, make_jwk, monkeypatch
+):
+    clock = _frozen_clock(monkeypatch)
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())
+    anonymous = make_jwk(signing_key, KID)
+    del anonymous["kid"]
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = {"keys": [anonymous]}
+    clock[0] += 301
+    for _ in range(3):
+        assert (await verifier.verify(mint()))["sub"] == "user_01ABC"
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 2  # the first load, one refused refresh
+
+
 async def test_an_outage_that_refuses_every_token_is_an_error_naming_the_exception(
     mint, fetcher, caplog
 ):

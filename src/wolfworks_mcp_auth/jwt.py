@@ -159,6 +159,10 @@ class WorkOSJWTVerifier:
                 url = self._jwks_url or await self._discover_jwks_url()
                 key_set = PyJWKSet.from_dict(await self._fetch_json(url))
                 keys = {key.key_id: key for key in key_set.keys if key.key_id}
+                if not keys:
+                    # `kid` is optional in a JWK. Holding nothing would skip every cooldown
+                    # below, and each request would then cost the issuer two fetches.
+                    raise ValueError("the JWKS publishes no key with a kid")
             except Exception as exc:
                 self._failed_at = time.monotonic()
                 # `repr`, because a timeout's text is empty and its type is the whole reason.
