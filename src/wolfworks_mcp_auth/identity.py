@@ -29,7 +29,7 @@ IdentityResolver = Callable[[AccessToken], Awaitable[Any]]
 _identity: contextvars.ContextVar[Any] = contextvars.ContextVar("wolfworks_mcp_identity")
 
 
-class IdentityRefused(Exception):  # noqa: N818 - named for what happened, not as an error type
+class IdentityRefused(Exception):
     """Raised by a resolver for a genuine token it will not act for.
 
     The message reaches the end user, so it should say what to do next.
@@ -48,16 +48,25 @@ def current_identity() -> Any:
 class IdentityGate:
     """A `ServerMiddleware`: `MCPServer(middleware=[IdentityGate(resolver)])`."""
 
-    def __init__(self, resolver: IdentityResolver) -> None:
+    def __init__(self, resolver: IdentityResolver, *, allow_unauthenticated: bool = False) -> None:
         self._resolver = resolver
+        self._allow_unauthenticated = allow_unauthenticated
 
     async def __call__(
         self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
     ) -> HandlerResult:
         access = get_access_token()
         if access is None:
-            # Auth is switched off (local development); there is no one to resolve.
-            return await call_next(ctx)
+            # The SDK only lets a request through without a token when the server was
+            # built without auth. That is a choice for local development, never a default:
+            # a server that merely forgot `auth=` must not run tools for strangers.
+            if self._allow_unauthenticated:
+                return await call_next(ctx)
+            logger.error(
+                "IdentityGate saw a request with no verified token, so the server has no "
+                "auth configured; refusing. Pass allow_unauthenticated=True to run without it."
+            )
+            raise MCPError(INTERNAL_ERROR, "Internal server error")
         try:
             identity = await self._resolver(access)
         except IdentityRefused as exc:

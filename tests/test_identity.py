@@ -63,7 +63,9 @@ async def _resolver(access: AccessToken) -> dict[str, str]:
 
 
 @contextlib.asynccontextmanager
-async def _client(resolver=_resolver, *, auth: bool = True, ran: list[str] | None = None):
+async def _client(
+    resolver=_resolver, *, auth: bool = True, ran: list[str] | None = None, **gate_options
+):
     secured = {
         "token_verifier": _StubVerifier(),
         "auth": AuthSettings(
@@ -73,7 +75,8 @@ async def _client(resolver=_resolver, *, auth: bool = True, ran: list[str] | Non
             validate_token_resource=True,
         ),
     }
-    server = MCPServer("test", middleware=[IdentityGate(resolver)], **(secured if auth else {}))
+    gate = IdentityGate(resolver, **gate_options)
+    server = MCPServer("test", middleware=[gate], **(secured if auth else {}))
     arrivals: list[int] = []
     second_is_past_the_gate, first_has_read = asyncio.Event(), asyncio.Event()
 
@@ -196,8 +199,18 @@ async def test_no_bearer_never_reaches_a_tool():
     assert ran == []
 
 
-async def test_without_auth_the_gate_steps_aside_and_publishes_no_identity():
-    async with _client(auth=False) as client:
+async def test_a_server_built_without_auth_runs_no_tool_behind_the_gate(caplog):
+    # Forgetting `auth=` and `token_verifier=` must not turn the gate into an open door.
+    ran: list[str] = []
+    async with _client(auth=False, ran=ran) as client:
+        response = await client.post("/mcp", headers=HEADERS, json=_call("leave_a_mark"))
+    assert response.json()["error"]["code"] == -32603
+    assert ran == []
+    assert "allow_unauthenticated" in caplog.text
+
+
+async def test_the_gate_steps_aside_only_when_told_to_and_publishes_no_identity():
+    async with _client(auth=False, allow_unauthenticated=True) as client:
         response = await client.post("/mcp", headers=HEADERS, json=_call("identity_or_none"))
     assert response.json()["result"]["structuredContent"] == {"result": "none"}
 
