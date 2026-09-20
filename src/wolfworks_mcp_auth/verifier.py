@@ -41,6 +41,13 @@ def api_token_access(
     )
 
 
+def _scopes(claim: Any) -> list[str]:
+    """RFC 8693 makes `scope` one space-separated string; some issuers send a list."""
+    if isinstance(claim, list):
+        return [str(scope) for scope in claim]
+    return str(claim or "").split()
+
+
 class WorkOSTokenVerifier(TokenVerifier):
     """Accepts a WorkOS JWT minted for this server's canonical resource.
 
@@ -80,7 +87,7 @@ class WorkOSTokenVerifier(TokenVerifier):
         return AccessToken(
             token=token,
             client_id=str(claims.get("client_id") or claims.get("azp") or claims["sub"]),
-            scopes=str(claims.get("scope") or "").split(),
+            scopes=_scopes(claims.get("scope")),
             expires_at=int(claims["exp"]),  # a NumericDate may carry a fraction
             # `aud` may be a list; the verifier has already proved this server is in it.
             resource=self._resource,

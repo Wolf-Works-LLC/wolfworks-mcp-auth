@@ -53,6 +53,11 @@ async def test_fractional_exp_is_accepted_as_whole_seconds(mint, fetcher):
     assert access.expires_at == int(exp)
 
 
+async def test_scope_claim_delivered_as_a_list_is_read_as_one(mint, fetcher):
+    access = await _verifier(fetcher).verify_token(mint(scope=["openid", "email"]))
+    assert access.scopes == ["openid", "email"]
+
+
 async def test_token_without_scope_claim_has_no_scopes(mint, fetcher):
     access = await _verifier(fetcher).verify_token(mint(drop=("scope",)))
     assert access.scopes == []
