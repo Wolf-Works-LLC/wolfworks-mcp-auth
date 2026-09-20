@@ -62,12 +62,12 @@ async def test_rejects_token_issued_in_the_future(mint, fetcher):
 
 async def test_leeway_is_a_minute_and_no_more(mint, fetcher):
     now, verifier = int(time.time()), _verifier(fetcher)
-    await verifier.verify(mint(iat=now - 3600, exp=now - 30))
-    await verifier.verify(mint(iat=now + 30))
+    await verifier.verify(mint(iat=now - 3600, exp=now - 55))
+    await verifier.verify(mint(iat=now + 55))
     with pytest.raises(JWTVerificationError, match="expired"):
-        await verifier.verify(mint(iat=now - 3600, exp=now - 120))
+        await verifier.verify(mint(iat=now - 3600, exp=now - 65))
     with pytest.raises(JWTVerificationError, match="iat"):
-        await verifier.verify(mint(iat=now + 120))
+        await verifier.verify(mint(iat=now + 65))
 
 
 async def test_rejects_token_without_a_kid(mint, fetcher):
@@ -244,17 +244,25 @@ async def test_concurrent_unknown_kids_share_one_refetch(mint, fetcher, other_ke
     assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 2
 
 
-async def test_refetch_is_allowed_again_once_the_cooldown_has_passed(
+async def test_cooldown_lasts_thirty_seconds_and_spraying_cannot_extend_it(
     mint, fetcher, other_key, make_jwk, monkeypatch
 ):
+    clock = [1000.0]
+    fake_time = types.SimpleNamespace(monotonic=lambda: clock[0])
+    monkeypatch.setattr("wolfworks_mcp_auth.jwt.time", fake_time)
     verifier = _verifier(fetcher)
     await verifier.verify(mint())
     with pytest.raises(JWTVerificationError, match="signing key"):
-        await verifier.verify(mint(key=other_key, kid="bogus"))  # spends the refetch
+        await verifier.verify(mint(key=other_key, kid="bogus"))  # t=0 spends the refetch
     fetcher.documents[f"{ISSUER}/oauth2/jwks"] = {"keys": [make_jwk(other_key, "rotated")]}
+    for _ in range(2):  # t=10 and t=20: an attempt that was skipped restarts nothing
+        clock[0] += 10
+        with pytest.raises(JWTVerificationError, match="signing key"):
+            await verifier.verify(mint(key=other_key, kid="bogus-again"))
+    clock[0] += 9  # t=29
     with pytest.raises(JWTVerificationError, match="signing key"):
-        await verifier.verify(mint(key=other_key, kid="rotated"))  # still cooling down
-    monkeypatch.setattr("wolfworks_mcp_auth.jwt._REFETCH_COOLDOWN_SECONDS", 0)
+        await verifier.verify(mint(key=other_key, kid="rotated"))
+    clock[0] += 2  # t=31
     assert (await verifier.verify(mint(key=other_key, kid="rotated")))["sub"] == "user_01ABC"
 
 
