@@ -4,7 +4,10 @@
 
 Three hops: the unauthenticated challenge, the protected resource metadata it
 points at, and the authorization server metadata that names. Exit status is 0
-only when every hop answers as the MCP authorization specification requires.
+when the challenge is a direct 401 carrying `resource_metadata`, both documents
+answer 200, and neither the challenge nor `scopes_supported` advertises
+`offline_access`. It does not read the documents further: a `resource` or an
+`issuer` that a client would refuse still passes.
 """
 
 from __future__ import annotations

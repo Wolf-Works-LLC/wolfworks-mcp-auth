@@ -37,7 +37,11 @@ class IdentityRefused(Exception):  # noqa: N818 - named for what happened, not a
 
 
 def current_identity() -> Any:
-    """Return whatever the resolver returned for the request being handled."""
+    """Return whatever the resolver returned for the request being handled.
+
+    Raises `LookupError` when nothing was resolved: outside a request, or on a
+    server running without auth.
+    """
     return _identity.get()
 
 
