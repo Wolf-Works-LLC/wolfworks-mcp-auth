@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # The SDK API this package implements is provisional; hear about a break on a
+    # Monday rather than during someone's deploy.
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
