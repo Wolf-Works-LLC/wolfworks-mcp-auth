@@ -52,8 +52,11 @@ from wolfworks_mcp_auth import (
     current_identity,
 )
 
-# Neither takes a trailing slash. The SDK advertises both exactly as written, and
-# a client compares the issuer with the authorization server's own, as a string.
+# Write both plainly: lower-case host, no default port, no trailing slash. Both are
+# compared as strings. A client checks the issuer against the authorization
+# server's own, and this package checks a token's `aud` against RESOURCE as you
+# wrote it, while the SDK advertises RESOURCE normalised. `https://Host:443/mcp`
+# here means a 401 for every token a well-behaved client presents.
 ISSUER = os.environ["WORKOS_ISSUER"]  # your AuthKit domain
 RESOURCE = os.environ["MCP_RESOURCE"]  # this server's MCP URL
 
