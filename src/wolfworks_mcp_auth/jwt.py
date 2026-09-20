@@ -9,6 +9,7 @@ webhook paths that the SDK never sees.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -24,10 +25,21 @@ _REQUIRED_CLAIMS = ["exp", "iat", "sub"]
 # Anyone can send a token naming an unknown key id. It buys one refetch per
 # cooldown, not one each; PyJWT's own `PyJWKClient` uses the same 30 seconds.
 _REFETCH_COOLDOWN_SECONDS = 30
+_MAX_MESSAGE_LENGTH = 300
+
+logger = logging.getLogger(__name__)
 
 
 class JWTVerificationError(Exception):
-    """The token is not acceptable. The message says why and is safe to log."""
+    """The token is not acceptable. The message says why and is safe to log.
+
+    Safe because it is made so here: the libraries underneath echo parts of the
+    token, which its sender wrote, so the text is cut to one bounded line.
+    """
+
+    def __init__(self, message: str) -> None:
+        one_line = "".join(c if c.isprintable() else " " for c in message)
+        super().__init__(one_line[:_MAX_MESSAGE_LENGTH])
 
 
 def looks_like_jwt(token: str) -> bool:
@@ -58,6 +70,7 @@ class WorkOSJWTVerifier:
         jwks_url: str | None = None,
         leeway_seconds: int = 60,
         cache_ttl_seconds: int = 300,
+        max_stale_seconds: int = 86400,
         fetch_json: JsonFetcher = _fetch_json,
     ) -> None:
         if not issuer:
@@ -71,11 +84,15 @@ class WorkOSJWTVerifier:
         self._jwks_url = jwks_url
         self._leeway = leeway_seconds
         self._ttl = cache_ttl_seconds
+        self._max_stale = max_stale_seconds
         self._fetch_json = fetch_json
         self._keys: dict[str, PyJWK] = {}
         self._keys_fetched_at = 0.0
         self._refetched_at = float("-inf")
-        self._lock = asyncio.Lock()
+        self._failed_at = float("-inf")
+        # One lock per event loop: a lock made here would belong to whichever loop
+        # first contended for it, and a module-level verifier outlives its loop.
+        self._locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 
     async def verify(self, token: str) -> dict[str, Any]:
         """Return the token's claims, or raise `JWTVerificationError`."""
@@ -130,9 +147,12 @@ class WorkOSJWTVerifier:
         # and again inside it because the request ahead may have just fetched.
         if self._cache_answers(force=force):
             return self._keys
-        async with self._lock:
+        async with self._lock():
             if self._cache_answers(force=force):
                 return self._keys
+            if (time.monotonic() - self._failed_at) < _REFETCH_COOLDOWN_SECONDS:
+                # The last fetch failed moments ago: do not queue another behind it.
+                return self._held_keys_or_raise("backing off after a failed fetch")
             if force:
                 self._refetched_at = time.monotonic()
             try:
@@ -140,10 +160,31 @@ class WorkOSJWTVerifier:
                 key_set = PyJWKSet.from_dict(await self._fetch_json(url))
                 keys = {key.key_id: key for key in key_set.keys if key.key_id}
             except Exception as exc:
-                raise JWTVerificationError(f"JWKS unavailable: {exc}") from exc
+                self._failed_at = time.monotonic()
+                held = self._held_keys_or_raise(str(exc), cause=exc)
+                logger.warning("JWKS refresh failed, serving the cached keys: %s", exc)
+                return held
             self._keys = keys
             self._keys_fetched_at = time.monotonic()
             return self._keys
+
+    def _held_keys_or_raise(
+        self, reason: str, *, cause: Exception | None = None
+    ) -> dict[str, PyJWK]:
+        """Keys are public and were published by the issuer, so an outage there is no
+        reason to refuse every valid token here - until they are older than the cap."""
+        age = time.monotonic() - self._keys_fetched_at
+        if self._keys and age < self._max_stale:
+            return self._keys
+        raise JWTVerificationError(f"JWKS unavailable: {reason}") from cause
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._locks.get(loop)
+        if lock is None:
+            self._locks = {k: v for k, v in self._locks.items() if not k.is_closed()}
+            lock = self._locks[loop] = asyncio.Lock()
+        return lock
 
     async def _discover_jwks_url(self) -> str:
         document = await self._fetch_json(f"{self._issuer}/.well-known/openid-configuration")

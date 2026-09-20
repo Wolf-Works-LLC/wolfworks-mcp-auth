@@ -325,3 +325,102 @@ def test_looks_like_jwt(mint):
     assert looks_like_jwt(mint())
     assert not looks_like_jwt("0123456789abcdef0123456789abcdef")
     assert not looks_like_jwt("a.b.c")
+
+
+def _frozen_clock(monkeypatch) -> list[float]:
+    clock = [1000.0]
+    # Only the package's view of the clock: the event loop reads `time.monotonic` too.
+    monkeypatch.setattr(
+        "wolfworks_mcp_auth.jwt.time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    return clock
+
+
+async def test_a_failed_refresh_serves_the_keys_already_held(mint, fetcher, monkeypatch, caplog):
+    clock = _frozen_clock(monkeypatch)
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("issuer is down")
+    clock[0] += 301  # past the TTL, so the next verification tries to refresh
+    assert (await verifier.verify(mint()))["sub"] == "user_01ABC"
+    assert "serving the cached keys" in caplog.text
+
+
+async def test_a_failed_refresh_backs_off_rather_than_retrying_per_request(
+    mint, fetcher, monkeypatch
+):
+    clock = _frozen_clock(monkeypatch)
+    verifier = _verifier(fetcher)
+    await verifier.verify(mint())
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("issuer is down")
+    clock[0] += 301
+    for _ in range(5):
+        await verifier.verify(mint())
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 2  # the first load, one failed refresh
+    clock[0] += 31  # the cooldown has passed: one more attempt, not five
+    await verifier.verify(mint())
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 3
+
+
+async def test_held_keys_are_not_served_past_the_staleness_cap(mint, fetcher, monkeypatch):
+    clock = _frozen_clock(monkeypatch)
+    verifier = WorkOSJWTVerifier(
+        issuer=ISSUER, audiences=(RESOURCE,), max_stale_seconds=3600, fetch_json=fetcher
+    )
+    await verifier.verify(mint())
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("issuer is down")
+    clock[0] += 3599
+    await verifier.verify(mint())
+    clock[0] += 2
+    with pytest.raises(JWTVerificationError, match="JWKS unavailable"):
+        await verifier.verify(mint())
+
+
+async def test_with_no_keys_held_a_failed_fetch_backs_off_and_still_fails_closed(
+    mint, fetcher, monkeypatch
+):
+    _frozen_clock(monkeypatch)
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("issuer is down")
+    verifier = _verifier(fetcher)
+    for _ in range(3):
+        with pytest.raises(JWTVerificationError, match="JWKS unavailable"):
+            await verifier.verify(mint())
+    assert fetcher.calls.count(f"{ISSUER}/oauth2/jwks") == 1
+
+
+async def test_error_text_is_one_bounded_line(fetcher, signing_key):
+    import jwt as pyjwt
+
+    hostile = pyjwt.encode(
+        {"iss": ISSUER, "aud": RESOURCE, "sub": "x", "iat": 1, "exp": 9999999999},
+        signing_key,
+        algorithm="RS256",
+        headers={"kid": KID, "crit": ["x\nINJECTED second line " + "A" * 5000]},
+    )
+    with pytest.raises(JWTVerificationError) as raised:
+        await _verifier(fetcher).verify(hostile)
+    message = str(raised.value)
+    assert "\n" not in message and "\r" not in message
+    assert len(message) <= 300
+
+
+def test_one_verifier_serves_two_event_loops(mint, jwks):
+    import asyncio
+
+    async def slow(url: str):
+        await asyncio.sleep(0.01)
+        return jwks
+
+    verifier = WorkOSJWTVerifier(
+        issuer=ISSUER,
+        audiences=(RESOURCE,),
+        jwks_url="https://keys.test/jwks",
+        cache_ttl_seconds=0,  # every call refreshes, so callers contend for the lock
+        fetch_json=slow,
+    )
+
+    async def contend():
+        return await asyncio.gather(*(verifier.verify(mint()) for _ in range(3)))
+
+    assert len(asyncio.run(contend())) == 3
+    assert len(asyncio.run(contend())) == 3
