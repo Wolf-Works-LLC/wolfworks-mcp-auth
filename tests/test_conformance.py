@@ -81,7 +81,10 @@ async def test_dead_authorization_server_metadata_fails():
 
 async def test_openid_configuration_is_accepted_in_place_of_rfc8414():
     oidc = f"{ISSUER}/.well-known/openid-configuration"
-    overrides = {AS_METADATA: httpx.Response(404), oidc: httpx.Response(200, json={})}
+    overrides = {
+        AS_METADATA: httpx.Response(404),
+        oidc: httpx.Response(200, json={"issuer": ISSUER}),
+    }
     async with _client(**overrides) as client:
         report = await probe(SERVER, client=client)
     assert report.ok, report.failures
@@ -168,3 +171,66 @@ def test_report_serialises():
 
     report = ProbeReport(hops=[(SERVER, 401)], failures=[])
     assert json.loads(report.to_json()) == {"ok": True, "hops": [[SERVER, 401]], "failures": []}
+
+
+async def test_resource_metadata_describing_another_resource_fails():
+    body = {"resource": "https://elsewhere.test/mcp", "authorization_servers": [ISSUER]}
+    async with _client(**{PRM: httpx.Response(200, json=body)}) as client:
+        report = await probe(SERVER, client=client)
+    assert not report.ok
+    assert "https://elsewhere.test/mcp" in report.failures[0]
+
+
+@pytest.mark.parametrize("issuer", ["https://someone-else.test", ISSUER + "/"])
+async def test_authorization_server_metadata_for_another_issuer_fails(issuer):
+    # A trailing slash counts: RFC 8414 requires the two strings to be identical.
+    async with _client(**{AS_METADATA: httpx.Response(200, json={"issuer": issuer})}) as client:
+        report = await probe(SERVER, client=client)
+    assert not report.ok
+    assert ISSUER in report.failures[0]
+
+
+@pytest.mark.parametrize("hop", [PRM, AS_METADATA])
+async def test_metadata_that_is_not_a_json_object_is_a_failure_not_a_traceback(hop):
+    for body in (httpx.Response(200, text="<html>hello</html>"), httpx.Response(200, json=[1])):
+        async with _client(**{hop: body}) as client:
+            report = await probe(SERVER, client=client)
+        assert not report.ok
+        assert report.failures
+
+
+async def test_unreachable_server_is_a_failure_not_a_traceback():
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as client:
+        report = await probe(SERVER, client=client)
+    assert not report.ok
+    assert "no route to host" in report.failures[0]
+
+
+async def test_a_server_that_never_answers_meets_the_deadline(monkeypatch):
+    import asyncio
+
+    async def stall(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(401)
+
+    monkeypatch.setattr("wolfworks_mcp_auth.conformance._DEADLINE_SECONDS", 0.05)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stall)) as client:
+        report = await probe(SERVER, client=client)
+    assert not report.ok
+    assert "deadline" in report.failures[0]
+
+
+def test_cli_pass_path_and_json_output(monkeypatch, capsys):
+    async def fake_probe(url: str, **_):
+        from wolfworks_mcp_auth.conformance import ProbeReport
+
+        return ProbeReport(hops=[(url, 401), (PRM, 200), (AS_METADATA, 200)], failures=[])
+
+    monkeypatch.setattr("wolfworks_mcp_auth.conformance.probe", fake_probe)
+    assert main([SERVER]) == 0
+    assert "PASS" in capsys.readouterr().out
+    assert main([SERVER, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True

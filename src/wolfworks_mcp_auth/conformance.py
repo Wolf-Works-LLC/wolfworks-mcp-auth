@@ -33,6 +33,9 @@ _INITIALIZE = {
 }
 _HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 _RESOURCE_METADATA = re.compile(r'resource_metadata="([^"]+)"')
+# httpx's timeout is per read, so a server that trickles bytes could hold a probe
+# for ever; this bounds the whole walk.
+_DEADLINE_SECONDS = 60.0
 
 
 @dataclass
@@ -60,11 +63,18 @@ def _authorization_server_metadata_urls(issuer: str) -> list[str]:
 
 async def probe(url: str, *, client: httpx.AsyncClient | None = None) -> ProbeReport:
     report = ProbeReport()
-    if client is None:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as owned:
-            await _walk(url, owned, report)
-    else:
-        await _walk(url, client, report)
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=10) as owned:
+                await asyncio.wait_for(_walk(url, owned, report), _DEADLINE_SECONDS)
+        else:
+            await asyncio.wait_for(_walk(url, client, report), _DEADLINE_SECONDS)
+    except TimeoutError:
+        report.failures.append(f"no answer within the {_DEADLINE_SECONDS:g}s deadline")
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+        # A hop that is unreachable, or answers 200 with something other than the
+        # JSON object the specification requires, is a finding - not a traceback.
+        report.failures.append(f"could not read a hop: {exc!r}")
     return report
 
 
@@ -96,6 +106,11 @@ async def _walk(url: str, client: httpx.AsyncClient, report: ProbeReport) -> Non
     document = metadata.json()
     if "offline_access" in document.get("scopes_supported", []):
         report.failures.append("protected resource metadata advertises offline_access")
+    if document.get("resource") != url:
+        # RFC 9728 s3.3: a client must refuse metadata that describes another resource.
+        report.failures.append(
+            f"protected resource metadata describes {document.get('resource')!r}, not {url!r}"
+        )
     servers = document.get("authorization_servers") or []
     if not servers:
         report.failures.append("protected resource metadata names no authorization server")
@@ -106,6 +121,9 @@ async def _walk(url: str, client: httpx.AsyncClient, report: ProbeReport) -> Non
         response = await client.get(candidate, follow_redirects=False)
         if response.status_code == 200:
             report.hops.append((candidate, 200))
+            if response.json().get("issuer") != issuer:
+                # RFC 8414 s3.3: the strings must be identical, trailing slash included.
+                report.failures.append(f"{candidate} is not the metadata of {issuer!r}")
             return
     report.hops.append((candidate, response.status_code))
     report.failures.append(f"authorization server {issuer} serves no metadata document")
