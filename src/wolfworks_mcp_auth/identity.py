@@ -40,7 +40,7 @@ def current_identity() -> Any:
     """Return whatever the resolver returned for the request being handled.
 
     Raises `LookupError` when nothing was resolved: outside a request, or on a
-    server running without auth.
+    server running without auth behind a gate built with `allow_unauthenticated=True`.
     """
     return _identity.get()
 
