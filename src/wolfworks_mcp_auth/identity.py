@@ -66,7 +66,7 @@ class IdentityGate:
             raise
         except Exception:
             # The SDK would put this exception's text in the response, and a failed
-            # lookup can name anything. Tool errors are already sealed the same way.
+            # lookup can name anything. It withholds a failing tool's text already.
             logger.exception("identity resolver failed")
             raise MCPError(INTERNAL_ERROR, "Internal server error") from None
         reset = _identity.set(identity)
