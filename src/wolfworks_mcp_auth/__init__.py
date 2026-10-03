@@ -1,4 +1,5 @@
-"""WorkOS token verification and an identity gate for MCP servers.
+"""WorkOS token verification and an identity gate for MCP servers, and a
+resource-and-client check for every surface that is not MCP.
 
 The `mcp` SDK owns the protocol. This package owns WorkOS. The application
 owns its identity.
@@ -11,6 +12,13 @@ from wolfworks_mcp_auth.identity import (
     current_identity,
 )
 from wolfworks_mcp_auth.jwt import JWTVerificationError, WorkOSJWTVerifier, looks_like_jwt
+from wolfworks_mcp_auth.surface import (
+    PrincipalKind,
+    RefusalReason,
+    SurfaceToken,
+    SurfaceTokenRefused,
+    SurfaceTokenVerifier,
+)
 from wolfworks_mcp_auth.verifier import WorkOSTokenVerifier, api_token_access
 
 __all__ = [
@@ -18,6 +26,11 @@ __all__ = [
     "IdentityGate",
     "IdentityRefused",
     "JWTVerificationError",
+    "PrincipalKind",
+    "RefusalReason",
+    "SurfaceToken",
+    "SurfaceTokenRefused",
+    "SurfaceTokenVerifier",
     "WorkOSJWTVerifier",
     "WorkOSTokenVerifier",
     "api_token_access",
