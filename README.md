@@ -116,6 +116,30 @@ def whoami() -> str:
     return current_identity().email
 ```
 
+### Refusing other surfaces' clients at `/mcp`
+
+`WorkOSTokenVerifier` accepts any client a genuine token names, because MCP
+clients register themselves. The device and service clients a product registers
+for its *other* surfaces are the exception: a phished device sign-in must never
+become an MCP session, even if WorkOS would mint that client a token for the MCP
+resource. Products pass every GC-4 device and service `client_id`:
+
+```python
+WorkOSTokenVerifier(
+    issuer=ISSUER,
+    resource=RESOURCE,
+    fallback=api_tokens,
+    refused_client_ids={os.environ["AGENT_CLIENT_ID"], os.environ["PIPELINE_CLIENT_ID"]},
+)
+```
+
+A JWT is refused, and the SDK answers `401` `invalid_token`, when its `client_id`,
+its `azp` or its `sub` is in the set, or when any of them is not a string. It
+takes any collection of client IDs: never one bare string, and no entry empty or
+containing whitespace (`"client_01ABC\n"` from a config file would never match).
+The default is empty, which skips the check entirely and changes nothing. API
+tokens never reach it.
+
 ### Mounting it inside FastAPI or Starlette
 
 Four things are easy to miss, and an unauthenticated smoke test sees none of them:
