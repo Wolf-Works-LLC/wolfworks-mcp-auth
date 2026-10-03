@@ -180,10 +180,11 @@ try:
     accepted = await ingest.verify(bearer)
 except SurfaceTokenRefused as refused:
     log.info("refused: %s", refused.reason)  # e.g. "audience", "client_unexpected"
-    return 401
+    # The issuer's outage is not the caller's fault: a 401 tells a device it was revoked.
+    return 503 if refused.reason == "jwks_unavailable" else 401
 
 accepted.kind  # "user" | "service" | "device": what you configured, never guessed
-accepted.subject  # the WorkOS `sub`; map it to your own principal
+accepted.subject  # the WorkOS `sub`, never empty; map it to your own principal
 accepted.client_id
 accepted.claims
 ```
@@ -200,7 +201,15 @@ issuer, and a `/user_management/` issuer cannot be configured.
 `SurfaceTokenRefused` is a `JWTVerificationError`. Its `reason` is one of
 `client_id_missing`, `client_unexpected`, `audience`, `issuer`, `expired`,
 `signature`, `malformed`, `claims`, `jwks_unavailable` or `invalid`; its message
-is safe to log.
+is safe to log. Answer `jwks_unavailable` with `503` and every other reason with
+`401`. `jwks_unavailable` means the issuer's keys could not be had, not that the
+token is bad, and a device agent that receives `401` straight after a refresh
+concludes it was revoked and signs itself out.
+
+A `device` token is not yet a device. Before it acts, run your product's own
+device-record check (FR-10) and refuse with `401` if the record is missing or
+revoked. Revoking a single device in WorkOS is unverified, and this package
+keeps no device records.
 
 Do not pass client IDs to `WorkOSJWTVerifier` as `audiences`. A WorkOS token
 requested without a `resource` carries the tenant's default application client
@@ -237,8 +246,10 @@ serving the keys it holds — they are public, and the issuer published them —
 tries again after thirty seconds rather than once per request. It stops doing so
 a day after the last successful fetch, and with no keys at all it refuses every
 JWT; either is logged as an error. `WorkOSJWTVerifier` takes `max_stale_seconds`
-to change the day; `WorkOSTokenVerifier` uses the default. API tokens never touch
-the JWKS and are unaffected.
+to change the day; `WorkOSTokenVerifier` and `SurfaceTokenVerifier` use the
+default, and pass through neither it, `leeway_seconds` nor `cache_ttl_seconds`.
+`SurfaceTokenVerifier` reports the refusal as `jwks_unavailable`: answer it `503`.
+API tokens never touch the JWKS and are unaffected.
 
 ## What the probe checks
 

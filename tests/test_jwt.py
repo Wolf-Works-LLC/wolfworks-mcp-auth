@@ -93,12 +93,29 @@ async def test_rejects_token_missing_a_required_claim(mint, fetcher, claim):
         ({"exp": 1, "iat": 0}, "expired"),
         ({"algorithm": "RS384"}, "signature"),
         ({"kid": "never-published"}, "signature"),
+        ({"nbf": int(time.time()) + 7200}, "invalid"),
+        ({"iat": int(time.time()) + 7200}, "invalid"),
+        ({"sub": 7}, "invalid"),
     ],
 )
 async def test_every_refusal_names_its_reason(mint, fetcher, overrides, reason):
     with pytest.raises(JWTVerificationError) as raised:
         await _verifier(fetcher).verify(mint(**overrides))
     assert raised.value.reason == reason
+
+
+async def test_a_token_that_is_not_a_jwt_is_refused_as_malformed(fetcher):
+    with pytest.raises(JWTVerificationError) as raised:
+        await _verifier(fetcher).verify("not.a.jwt")
+    assert raised.value.reason == "malformed"
+
+
+async def test_an_unreachable_jwks_is_refused_as_jwks_unavailable(mint, fetcher):
+    # Our outage, not the caller's: a host answers it 503, never 401.
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("issuer is down")
+    with pytest.raises(JWTVerificationError) as raised:
+        await _verifier(fetcher).verify(mint())
+    assert raised.value.reason == "jwks_unavailable"
 
 
 async def test_rejects_signature_from_another_key(mint, fetcher, other_key):

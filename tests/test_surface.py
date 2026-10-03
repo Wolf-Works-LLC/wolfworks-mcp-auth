@@ -5,9 +5,12 @@ The library half of H-AC-1 (audience), H-AC-2 (client) and H-AC-3 (first-party i
 
 from __future__ import annotations
 
+import copy
+import pickle
 import time
 from types import MappingProxyType
 
+import httpx
 import pytest
 from conftest import ISSUER, RESOURCE, FakeFetcher
 
@@ -175,8 +178,35 @@ async def test_refuses_a_token_naming_an_unpublished_key(mint, fetcher, other_ke
     assert (await _refusal(_verifier(fetcher), token)).reason == "signature"
 
 
+async def test_refuses_an_empty_subject(mint, fetcher):
+    # PyJWT's `require` passes `""`; mapped to a principal, it could match a defaulted column.
+    token = mint(aud=SURFACE, client_id=USER_CLIENT, sub="")
+    assert (await _refusal(_verifier(fetcher), token)).reason == "claims"
+
+
+async def test_an_unreachable_jwks_is_refused_as_jwks_unavailable(mint, fetcher):
+    fetcher.documents[f"{ISSUER}/oauth2/jwks"] = httpx.ConnectError("issuer is down")
+    token = mint(aud=SURFACE, client_id=USER_CLIENT)
+    assert (await _refusal(_verifier(fetcher), token)).reason == "jwks_unavailable"
+
+
 async def test_refuses_garbage_as_malformed(fetcher):
     assert (await _refusal(_verifier(fetcher), "not.a.jwt")).reason == "malformed"
+
+
+def _pickled(error: Exception) -> Exception:
+    return pickle.loads(pickle.dumps(error))  # noqa: S301 - our own object, round-tripped
+
+
+@pytest.mark.parametrize("duplicate", [copy.copy, _pickled], ids=["copy", "pickle"])
+async def test_a_refusal_survives_copy_and_pickle(mint, fetcher, duplicate):
+    # Process pools and job queues copy exceptions; the reason must come through.
+    token = mint(aud=SURFACE, client_id="client_01NOBODY")
+    refusal = await _refusal(_verifier(fetcher), token)
+    duplicated = duplicate(refusal)
+    assert isinstance(duplicated, SurfaceTokenRefused)
+    assert duplicated.reason == "client_unexpected"
+    assert str(duplicated) == str(refusal)
 
 
 async def test_a_refusal_is_a_jwt_verification_error(mint, fetcher):
@@ -192,13 +222,24 @@ async def test_a_refusal_is_a_jwt_verification_error(mint, fetcher):
     ("kwargs", "error", "message"),
     [
         ({"resource": ""}, ValueError, "resource"),
+        ({"resource": [SURFACE]}, TypeError, "resource"),
+        ({"resource": None}, TypeError, "resource"),
         ({"expected_clients": {}}, ValueError, "expected_clients"),
         ({"expected_clients": {"": "user"}}, ValueError, "client"),
         ({"expected_clients": {USER_CLIENT: "admin"}}, ValueError, "kind"),
         ({"expected_clients": [USER_CLIENT]}, TypeError, "mapping"),
         ({"expected_clients": USER_CLIENT}, TypeError, "mapping"),
     ],
-    ids=["no-resource", "no-clients", "empty-client", "unknown-kind", "list", "string"],
+    ids=[
+        "no-resource",
+        "resource-list",
+        "resource-none",
+        "no-clients",
+        "empty-client",
+        "unknown-kind",
+        "list",
+        "string",
+    ],
 )
 def test_construction_without_usable_configuration_raises(kwargs, error, message):
     arguments = {"issuer": ISSUER, "resource": SURFACE, "expected_clients": EXPECTED} | kwargs

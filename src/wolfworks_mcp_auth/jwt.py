@@ -2,8 +2,8 @@
 
 This is the one thing the `mcp` SDK cannot do for us: it defines where a
 token verifier plugs in, not how a particular identity provider's tokens are
-checked. It needs no MCP server, so the same check guards REST, WebSocket and
-webhook paths that the SDK never sees.
+checked. It needs no MCP server, and `SurfaceTokenVerifier` wraps it for the
+surfaces that are not MCP. Do not use it alone there: it checks no client.
 """
 
 from __future__ import annotations
