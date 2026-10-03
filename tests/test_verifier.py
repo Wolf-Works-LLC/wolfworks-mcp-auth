@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 import httpx
@@ -172,3 +173,93 @@ async def test_non_jwt_bearer_without_a_fallback_returns_none(fetcher):
 def test_construction_without_required_configuration_raises(kwargs, message):
     with pytest.raises(ValueError, match=message):
         WorkOSTokenVerifier(**kwargs)
+
+
+# --- GC-6: clients registered for other surfaces are refused at /mcp --------------------
+
+DEVICE_CLIENT = "client_01DEVICE"
+SERVICE_CLIENT = "client_01SERVICE"
+REFUSED = (DEVICE_CLIENT, SERVICE_CLIENT)
+
+
+def _refusing(fetcher: FakeFetcher, refused=REFUSED, fallback=None) -> WorkOSTokenVerifier:
+    return WorkOSTokenVerifier(
+        issuer=ISSUER,
+        resource=RESOURCE,
+        fallback=fallback,
+        fetch_json=fetcher,
+        refused_client_ids=refused,
+    )
+
+
+@pytest.mark.parametrize("client_id", REFUSED)
+async def test_a_refused_client_id_is_an_invalid_token(mint, fetcher, client_id, caplog):
+    # `None` is what the SDK answers 401 `invalid_token` for.
+    caplog.set_level(logging.INFO, logger="wolfworks_mcp_auth.verifier")
+    assert await _refusing(fetcher).verify_token(mint(client_id=client_id)) is None
+    assert client_id in caplog.text
+
+
+async def test_a_refused_client_arriving_through_the_azp_fallback_is_refused(mint, fetcher):
+    token = mint(drop=("client_id",), azp=DEVICE_CLIENT)
+    assert await _refusing(fetcher).verify_token(token) is None
+
+
+async def test_a_refused_client_arriving_through_the_sub_fallback_is_refused(mint, fetcher):
+    # A client-credentials token may carry its client ID as `sub` and neither other claim.
+    token = mint(drop=("client_id",), sub=SERVICE_CLIENT)
+    assert await _refusing(fetcher).verify_token(token) is None
+
+
+async def test_a_refused_azp_is_refused_whatever_client_id_says(mint, fetcher):
+    token = mint(client_id="client_01XYZ", azp=DEVICE_CLIENT)
+    assert await _refusing(fetcher).verify_token(token) is None
+
+
+async def test_other_clients_are_still_accepted(mint, fetcher):
+    access = await _refusing(fetcher).verify_token(mint())
+    assert access is not None and access.client_id == "client_01XYZ"
+    via_azp = await _refusing(fetcher).verify_token(mint(drop=("client_id",), azp="client_azp"))
+    assert via_azp.client_id == "client_azp"
+
+
+async def test_with_no_refused_clients_nothing_changes(mint, fetcher):
+    for verifier in (_verifier(fetcher), _refusing(fetcher, refused=())):
+        for token in (
+            mint(client_id=DEVICE_CLIENT),
+            mint(drop=("client_id",), azp=DEVICE_CLIENT),
+            mint(drop=("client_id",), sub=SERVICE_CLIENT),
+        ):
+            assert (await verifier.verify_token(token)).client_id in REFUSED
+
+
+async def test_the_api_token_fallback_is_unaffected(fetcher):
+    async def fallback(token: str) -> AccessToken | None:
+        # Even an API token whose user id collides with a refused client ID.
+        return api_token_access(token, user_id=DEVICE_CLIENT, resource=RESOURCE, scopes=["openid"])
+
+    access = await _refusing(fetcher, fallback=fallback).verify_token(API_TOKEN)
+    assert access is not None and access.subject == DEVICE_CLIENT
+
+
+def test_refused_client_ids_accepts_any_collection_and_keeps_its_own_copy(mint, fetcher):
+    refused = [DEVICE_CLIENT]
+    verifier = _refusing(fetcher, refused=refused)
+    refused.append(SERVICE_CLIENT)
+    assert verifier.refused_client_ids == frozenset({DEVICE_CLIENT})
+    assert _refusing(fetcher, refused={DEVICE_CLIENT}).refused_client_ids == {DEVICE_CLIENT}
+
+
+@pytest.mark.parametrize(
+    ("refused", "error"),
+    [
+        (DEVICE_CLIENT, TypeError),  # one string is a collection of characters
+        ([DEVICE_CLIENT, ""], ValueError),
+        ([DEVICE_CLIENT, 7], ValueError),
+        (None, TypeError),
+    ],
+    ids=["bare-string", "empty-id", "not-a-string", "none"],
+)
+def test_refused_client_ids_must_be_a_collection_of_non_empty_strings(fetcher, refused, error):
+    with pytest.raises(error, match="refused_client_ids"):
+        _refusing(fetcher, refused=refused)

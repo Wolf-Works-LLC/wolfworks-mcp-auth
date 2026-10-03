@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from typing import Any
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -54,6 +54,11 @@ class WorkOSTokenVerifier(TokenVerifier):
     A bearer that is not a JWT is offered to `fallback`, when one is configured,
     so long-lived API tokens keep working. A JWT that fails verification is
     never offered to it.
+
+    `refused_client_ids` names clients that may hold a token for this resource
+    but must never use it here: the device and service clients registered for
+    a product's other surfaces. A JWT whose `client_id`, `azp`, or the client
+    this verifier would otherwise report, is one of them is an invalid token.
     """
 
     def __init__(
@@ -64,9 +69,11 @@ class WorkOSTokenVerifier(TokenVerifier):
         fallback: FallbackResolver | None = None,
         jwks_url: str | None = None,
         fetch_json: JsonFetcher = _fetch_json,
+        refused_client_ids: Collection[str] = (),
     ) -> None:
         if not resource:
             raise ValueError("resource is required")
+        self._refused = _client_ids(refused_client_ids)
         self._resource = resource
         self._fallback = fallback
         self._jwt = WorkOSJWTVerifier(
@@ -81,7 +88,17 @@ class WorkOSTokenVerifier(TokenVerifier):
         except JWTVerificationError as exc:
             logger.info("rejected bearer token: %s", exc)
             return None
-        return self._access_token(token, claims)
+        access = self._access_token(token, claims)
+        refused = self._refused & {access.client_id, claims.get("client_id"), claims.get("azp")}
+        if refused:
+            logger.info("rejected bearer token: client %r is refused here", min(refused))
+            return None
+        return access
+
+    @property
+    def refused_client_ids(self) -> frozenset[str]:
+        """The clients this verifier refuses, whatever else their token proves."""
+        return self._refused
 
     def _access_token(self, token: str, claims: dict[str, Any]) -> AccessToken:
         return AccessToken(
@@ -94,3 +111,12 @@ class WorkOSTokenVerifier(TokenVerifier):
             subject=str(claims["sub"]),
             claims=claims,
         )
+
+
+def _client_ids(ids: Collection[str]) -> frozenset[str]:
+    # A bare string is a collection too: of single characters, none of them a client.
+    if isinstance(ids, str) or not isinstance(ids, Collection):
+        raise TypeError("refused_client_ids is a collection of client IDs, not one string")
+    if not all(isinstance(client_id, str) and client_id for client_id in ids):
+        raise ValueError("refused_client_ids holds only non-empty client ID strings")
+    return frozenset(ids)
