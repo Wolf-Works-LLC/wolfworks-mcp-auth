@@ -344,6 +344,8 @@ async def test_explicit_jwks_url_skips_discovery(mint, jwks):
         ({"issuer": "", "audiences": (RESOURCE,)}, "issuer"),
         ({"issuer": ISSUER, "audiences": ()}, "audience"),
         ({"issuer": ISSUER, "audiences": ("",)}, "audience"),
+        ({"issuer": ISSUER, "audiences": (RESOURCE,), "fetch_budget_seconds": 0}, "budget"),
+        ({"issuer": ISSUER, "audiences": (RESOURCE,), "fetch_budget_seconds": -1}, "budget"),
     ],
 )
 def test_construction_without_required_configuration_raises(kwargs, message):
@@ -487,3 +489,107 @@ def test_one_verifier_serves_two_event_loops(mint, jwks):
 
     assert len(asyncio.run(contend())) == 3
     assert len(asyncio.run(contend())) == 3
+
+
+class HangsAfterTheFirstFetch(FakeFetcher):
+    """Serves the key set once, then every later fetch waits until `release` is set."""
+
+    def __init__(self, documents):
+        super().__init__(documents)
+        self.release = asyncio.Event()
+
+    async def __call__(self, url: str):
+        if self.calls:
+            self.calls.append(url)
+            await self.release.wait()
+            return self.documents[url]
+        return await super().__call__(url)
+
+
+def _refreshing_verifier(fetcher, **kwargs) -> WorkOSJWTVerifier:
+    return WorkOSJWTVerifier(
+        issuer=ISSUER,
+        audiences=(RESOURCE,),
+        jwks_url="https://keys.test/jwks",
+        fetch_json=fetcher,
+        **kwargs,
+    )
+
+
+async def test_a_refresh_slower_than_its_budget_fails_and_serves_the_held_keys(
+    mint, jwks, monkeypatch, caplog
+):
+    clock = _frozen_clock(monkeypatch)
+    fetcher = HangsAfterTheFirstFetch({"https://keys.test/jwks": jwks})
+    verifier = _refreshing_verifier(fetcher, fetch_budget_seconds=0.05)
+    await verifier.verify(mint())
+    clock[0] += 301  # past the TTL: the next call refreshes, and the issuer hangs
+    claims = await asyncio.wait_for(verifier.verify(mint()), timeout=5)
+    assert claims["sub"] == "user_01ABC"
+    assert "serving the cached keys" in caplog.text and "TimeoutError" in caplog.text
+    await verifier.verify(mint())  # backing off: no third fetch
+    assert len(fetcher.calls) == 2
+
+
+async def test_a_caller_that_gives_up_leaves_the_refresh_running_for_everyone(
+    mint, jwks, monkeypatch
+):
+    # A sync bridge's timeout cancels its caller. That must not cancel the shared fetch:
+    # otherwise the next caller fetches again, and no outcome is ever recorded.
+    clock = _frozen_clock(monkeypatch)
+    fetcher = HangsAfterTheFirstFetch({"https://keys.test/jwks": jwks})
+    verifier = _refreshing_verifier(fetcher)
+    await verifier.verify(mint())
+    clock[0] += 301
+    for _ in range(3):
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(verifier.verify(mint()), timeout=0.02)
+    assert len(fetcher.calls) == 2  # the first load, then one refresh, still in flight
+    fetcher.release.set()
+    claims = await asyncio.wait_for(verifier.verify(mint()), timeout=5)
+    assert claims["sub"] == "user_01ABC"
+    await verifier.verify(mint())  # the abandoned refresh landed: served from the cache
+    assert len(fetcher.calls) == 2
+
+
+async def test_a_refresh_nobody_waits_for_records_its_failure(mint, jwks, monkeypatch):
+    clock = _frozen_clock(monkeypatch)
+    fetcher = HangsAfterTheFirstFetch({"https://keys.test/jwks": jwks})
+    verifier = _refreshing_verifier(fetcher, fetch_budget_seconds=0.05)
+    await verifier.verify(mint())
+    clock[0] += 301
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(verifier.verify(mint()), timeout=0.01)
+    await asyncio.sleep(0.2)  # the refresh outlives its caller, runs out of budget, and fails
+    assert verifier._failed_at == clock[0]
+    assert not verifier._refreshes  # and is forgotten once done
+
+
+def test_threads_each_running_a_loop_refresh_concurrently_without_sharing_a_task(mint, jwks):
+    # Each loop's fetch waits for the other's to start: both are in flight at once, so a
+    # refresh shared across loops would be awaited from the wrong loop and raise.
+    import threading
+
+    both_fetching = threading.Barrier(2)
+
+    async def fetch(url: str):
+        await asyncio.get_running_loop().run_in_executor(None, both_fetching.wait, 5)
+        return jwks
+
+    verifier = _refreshing_verifier(fetch, cache_ttl_seconds=0)
+    token, results, errors = mint(), [], []
+
+    def worker() -> None:
+        try:
+            results.append(asyncio.run(verifier.verify(token))["sub"])
+        except Exception as exc:  # every failure is the finding
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not errors, errors
+    assert results == ["user_01ABC", "user_01ABC"]
+    assert not verifier._refreshes  # each loop's refresh removed itself when done

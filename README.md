@@ -18,6 +18,7 @@ the three things it cannot know:
 | `WorkOSTokenVerifier` | the SDK `TokenVerifier` for WorkOS-issued JWTs, with an optional fallback for long-lived API tokens |
 | `IdentityGate` | a `ServerMiddleware` that runs *your* user lookup and turns its refusal into the one response shape the SDK can deliver |
 | `SurfaceTokenVerifier` | the same WorkOS check for a surface that is not MCP — a REST route, a socket, an ingest endpoint — bound to that surface's resource and to the clients it expects (0.2.0) |
+| `run_sync` / `SyncBridge` / `BridgeClosed` | one long-lived background event loop, so synchronous hosts such as Flask can call the async verifiers (0.2.0) |
 | `python -m wolfworks_mcp_auth.conformance <url>` | walks a server's discovery chain the way a client does |
 
 It names no host. Every URL is configuration you pass in.
@@ -216,6 +217,64 @@ requested without a `resource` carries the tenant's default application client
 ID as its `aud`, so a client-ID audience accepts tokens minted for anything.
 `audiences` takes resource URIs.
 
+### Calling a verifier from synchronous code (Flask)
+
+The verifiers are async. A synchronous host hands each call to one long-lived
+background event loop with `run_sync`, and never runs a loop per request:
+`asyncio.run` per call gives every request its own refresh inside the verifier,
+so concurrent requests stop sharing one JWKS fetch, and each one pays for a new
+loop.
+
+```python
+from flask import Flask, abort, request
+from wolfworks_mcp_auth import (
+    BridgeClosed,
+    SurfaceTokenRefused,
+    SurfaceTokenVerifier,
+    looks_like_jwt,
+    run_sync,
+)
+
+app = Flask(__name__)
+api = SurfaceTokenVerifier(issuer=ISSUER, resource=API_RESOURCE, expected_clients=API_CLIENTS)
+
+
+def oauth_principal():
+    scheme, _, bearer = request.headers.get("Authorization", "").partition(" ")
+    bearer = bearer.strip()
+    if scheme.lower() != "bearer" or not looks_like_jwt(bearer):
+        return None  # not a WorkOS token: your existing authentication, unchanged
+    try:
+        return run_sync(api.verify(bearer), timeout=10)
+    except SurfaceTokenRefused as refused:
+        # The issuer's outage is ours to answer, not the caller's: never 401 for it.
+        abort(503 if refused.reason == "jwks_unavailable" else 401)
+    except (TimeoutError, BridgeClosed):
+        abort(503)  # too slow, or shutting down: the token may well be fine
+```
+
+`run_sync` is safe from any number of threads. The loop runs on one daemon
+thread, which starts on the first call, not on import. Under gunicorn, each
+worker starts its own on its first request: a forked child forgets the parent's
+loop, whose thread does not exist there. `--preload` is safe as long as the
+master never calls `run_sync` or `start()` itself: that would fork a process
+with a running thread. To start the loop at worker boot instead, give the host
+its own `SyncBridge` and call its `start()` from gunicorn's `post_fork` hook.
+
+Every call waits at most `timeout` seconds (ten by default), then cancels the
+coroutine and raises `TimeoutError`; Ctrl-C while waiting cancels it too. A
+caller giving up never cancels the key refresh other requests share, and a
+refresh gets five seconds in all before it counts as failed and the held keys
+answer. So keep `timeout` above five seconds, or a slow issuer reaches your
+callers as `TimeoutError` instead of being answered from the cache. A call still
+running when the loop stops, at `close()` or at exit, raises `BridgeClosed`;
+answer it `503` too. Calling `run_sync` from async code raises `RuntimeError`:
+`await` there instead.
+
+`SyncBridge()` gives a host its own loop, with its own `default_timeout`,
+`close()` and context manager; one dropped without `close()` stops its loop when
+it is collected. Most hosts need only the shared one behind `run_sync`.
+
 ## What a refusal looks like
 
 When a token is genuine but your resolver raises `IdentityRefused`, the client
@@ -243,11 +302,15 @@ does carry a verified token still goes through your resolver.
 
 Signing keys are cached for five minutes. If a refresh fails, the verifier keeps
 serving the keys it holds — they are public, and the issuer published them — and
-tries again after thirty seconds rather than once per request. It stops doing so
+tries again after thirty seconds rather than once per request. A refresh that
+takes more than five seconds, discovery and key set together, has failed
+(`fetch_budget_seconds` changes it on `WorkOSJWTVerifier`), and a caller that
+stops waiting leaves it running for the rest. It stops serving held keys
 a day after the last successful fetch, and with no keys at all it refuses every
 JWT; either is logged as an error. `WorkOSJWTVerifier` takes `max_stale_seconds`
 to change the day; `WorkOSTokenVerifier` and `SurfaceTokenVerifier` use the
-default, and pass through neither it, `leeway_seconds` nor `cache_ttl_seconds`.
+default, and pass through neither it, `leeway_seconds`, `cache_ttl_seconds` nor
+`fetch_budget_seconds`.
 `SurfaceTokenVerifier` reports the refusal as `jwks_unavailable`: answer it `503`.
 API tokens never touch the JWKS and are unaffected.
 
