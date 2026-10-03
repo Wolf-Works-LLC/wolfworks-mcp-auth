@@ -257,9 +257,45 @@ def test_refused_client_ids_accepts_any_collection_and_keeps_its_own_copy(mint, 
         ([DEVICE_CLIENT, ""], ValueError),
         ([DEVICE_CLIENT, 7], ValueError),
         (None, TypeError),
+        ([DEVICE_CLIENT + "\n"], ValueError),  # from a config file: it would never match
+        ([" " + DEVICE_CLIENT], ValueError),
+        (["client 01DEVICE"], ValueError),
+        (["\t"], ValueError),
     ],
-    ids=["bare-string", "empty-id", "not-a-string", "none"],
+    ids=[
+        "bare-string",
+        "empty-id",
+        "not-a-string",
+        "none",
+        "trailing-newline",
+        "leading-space",
+        "inner-space",
+        "whitespace-only",
+    ],
 )
 def test_refused_client_ids_must_be_a_collection_of_non_empty_strings(fetcher, refused, error):
     with pytest.raises(error, match="refused_client_ids"):
         _refusing(fetcher, refused=refused)
+
+
+ODD_SHAPES = [[DEVICE_CLIENT], {"id": DEVICE_CLIENT}, 7, True]
+
+
+@pytest.mark.parametrize("claim", ["client_id", "azp"])
+@pytest.mark.parametrize("value", ODD_SHAPES, ids=["list", "dict", "int", "bool"])
+async def test_with_no_refused_clients_an_odd_client_claim_is_accepted_as_before(
+    mint, fetcher, claim, value
+):
+    # Main accepts these; the check must not turn them into a 500 when it is off.
+    token = mint(**{claim: value}) if claim == "client_id" else mint(drop=("client_id",), azp=value)
+    assert await _verifier(fetcher).verify_token(token) is not None
+
+
+@pytest.mark.parametrize("claim", ["client_id", "azp"])
+@pytest.mark.parametrize("value", ODD_SHAPES, ids=["list", "dict", "int", "bool"])
+async def test_with_refused_clients_an_odd_client_claim_is_refused_not_raised(
+    mint, fetcher, claim, value
+):
+    # Dropping it silently would let `[refused_client]` through: refuse it instead.
+    token = mint(**{claim: value})
+    assert await _refusing(fetcher).verify_token(token) is None

@@ -57,8 +57,8 @@ class WorkOSTokenVerifier(TokenVerifier):
 
     `refused_client_ids` names clients that may hold a token for this resource
     but must never use it here: the device and service clients registered for
-    a product's other surfaces. A JWT whose `client_id`, `azp`, or the client
-    this verifier would otherwise report, is one of them is an invalid token.
+    a product's other surfaces. A JWT whose `client_id`, `azp` or `sub` is one
+    of them, or is not a string, is an invalid token. Empty, the check is skipped.
     """
 
     def __init__(
@@ -89,11 +89,21 @@ class WorkOSTokenVerifier(TokenVerifier):
             logger.info("rejected bearer token: %s", exc)
             return None
         access = self._access_token(token, claims)
-        refused = self._refused & {access.client_id, claims.get("client_id"), claims.get("azp")}
-        if refused:
-            logger.info("rejected bearer token: client %r is refused here", min(refused))
+        if self._refused and self._names_a_refused_client(access, claims):
             return None
         return access
+
+    def _names_a_refused_client(self, access: AccessToken, claims: dict[str, Any]) -> bool:
+        named = [claims.get("client_id"), claims.get("azp"), claims.get("sub"), access.client_id]
+        present = [value for value in named if value is not None]
+        if not all(isinstance(value, str) for value in present):
+            # Never skipped: a list such as `[refused_client]` would otherwise walk past.
+            logger.info("rejected bearer token: a client claim is not a string")
+            return True
+        refused = self._refused.intersection(present)
+        if refused:
+            logger.info("rejected bearer token: client %r is refused here", min(refused))
+        return bool(refused)
 
     @property
     def refused_client_ids(self) -> frozenset[str]:
@@ -117,6 +127,11 @@ def _client_ids(ids: Collection[str]) -> frozenset[str]:
     # A bare string is a collection too: of single characters, none of them a client.
     if isinstance(ids, str) or not isinstance(ids, Collection):
         raise TypeError("refused_client_ids is a collection of client IDs, not one string")
-    if not all(isinstance(client_id, str) and client_id for client_id in ids):
-        raise ValueError("refused_client_ids holds only non-empty client ID strings")
+    if not all(isinstance(client_id, str) and _bare(client_id) for client_id in ids):
+        # `"client_01ABC\n"` from a config file would never match, and let that client in.
+        raise ValueError("refused_client_ids holds only non-empty client IDs without whitespace")
     return frozenset(ids)
+
+
+def _bare(client_id: str) -> bool:
+    return bool(client_id) and not any(character.isspace() for character in client_id)

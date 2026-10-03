@@ -134,9 +134,11 @@ WorkOSTokenVerifier(
 ```
 
 A JWT is refused, and the SDK answers `401` `invalid_token`, when its `client_id`,
-its `azp`, or the `sub` the verifier would otherwise report as its client is in
-the set. It takes any collection of non-empty strings, never one bare string.
-The default is empty, which changes nothing. API tokens never reach this check.
+its `azp` or its `sub` is in the set, or when any of them is not a string. It
+takes any collection of client IDs: never one bare string, and no entry empty or
+containing whitespace (`"client_01ABC\n"` from a config file would never match).
+The default is empty, which skips the check entirely and changes nothing. API
+tokens never reach it.
 
 ### Mounting it inside FastAPI or Starlette
 
