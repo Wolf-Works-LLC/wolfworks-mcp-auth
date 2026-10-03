@@ -19,10 +19,11 @@ from wolfworks_mcp_auth.surface import (
     SurfaceTokenRefused,
     SurfaceTokenVerifier,
 )
-from wolfworks_mcp_auth.sync import SyncBridge, run_sync
+from wolfworks_mcp_auth.sync import BridgeClosed, SyncBridge, run_sync
 from wolfworks_mcp_auth.verifier import WorkOSTokenVerifier, api_token_access
 
 __all__ = [
+    "BridgeClosed",
     "IDENTITY_REFUSED_CODE",
     "IdentityGate",
     "IdentityRefused",

@@ -2,7 +2,7 @@
 
 One long-lived event loop runs on one daemon thread, and every call is handed to
 it with `asyncio.run_coroutine_threadsafe`. Never a loop per request: an
-`asyncio.run` per call gives each request its own lock inside the verifier, so
+`asyncio.run` per call gives each request its own refresh inside the verifier, so
 concurrent requests no longer share one JWKS fetch, and each pays for a new loop.
 
 The loop starts on the first call, not on import. A forked child (a gunicorn
@@ -30,14 +30,22 @@ _THREAD_NAME = "wolfworks-mcp-auth-loop"
 _bridges: weakref.WeakSet[SyncBridge] = weakref.WeakSet()
 
 
+class BridgeClosed(RuntimeError):
+    """The bridge was closed - by `close()`, or at exit - while this call was running.
+
+    Not the caller's fault and not the token's: answer it `503`, as a timeout.
+    """
+
+
 class SyncBridge:
     """One background event loop that synchronous callers hand coroutines to.
 
     Safe to share between threads; the first call starts the loop, once. Each
     call waits at most `timeout` seconds (`default_timeout` when not given),
     then cancels the coroutine and raises `TimeoutError`. `close()` stops the
-    loop and cancels whatever is still running on it; a later call starts a
-    new one.
+    loop and cancels whatever is still running on it, whose callers get
+    `BridgeClosed`; a later call starts a new one. A bridge dropped without
+    `close()` stops its loop when it is collected.
     """
 
     def __init__(self, *, default_timeout: float = _DEFAULT_TIMEOUT_SECONDS) -> None:
@@ -45,6 +53,7 @@ class SyncBridge:
         self._guard = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._finalizer: weakref.finalize | None = None
         _bridges.add(self)
 
     @property
@@ -66,15 +75,24 @@ class SyncBridge:
         try:
             limit = self._default_timeout if timeout is None else _checked_timeout(timeout)
             _refuse_inside_a_running_loop()
-            future = asyncio.run_coroutine_threadsafe(coro, self._ensure_loop())
+            # Submitted under the guard, so `close()` cannot stop the loop in between:
+            # the call is either on this loop before it stops, or on the next one.
+            with self._guard:
+                future = asyncio.run_coroutine_threadsafe(coro, self._ensure_loop_locked())
         except BaseException:
             coro.close()  # never scheduled: close it, or it warns that it was never awaited
             raise
         try:
             return future.result(timeout=limit)
         except concurrent.futures.TimeoutError as exc:
-            future.cancel()  # and the task on the loop with it
+            if not future.cancel() and future.done():
+                return future.result()  # it finished as the timeout fired: not a timeout
             raise TimeoutError(f"the call did not finish within {limit} seconds") from exc
+        except concurrent.futures.CancelledError as exc:
+            raise BridgeClosed("the bridge was closed while the call was running") from exc
+        except BaseException:
+            future.cancel()  # Ctrl-C, or SystemExit, while waiting: do not leave it running
+            raise
 
     def close(self, *, timeout: float = 5.0) -> None:
         """Stop the loop, cancelling what is still running, and wait for its thread."""
@@ -83,12 +101,12 @@ class SyncBridge:
             if thread is threading.current_thread():
                 raise RuntimeError("a bridge cannot be closed from its own loop")
             self._loop = self._thread = None
+            if self._finalizer is not None:
+                self._finalizer.detach()
+                self._finalizer = None
         if loop is None or thread is None:
             return
-        try:
-            loop.call_soon_threadsafe(loop.stop)
-        except RuntimeError:
-            pass  # the loop already closed itself
+        _stop(loop)
         thread.join(timeout)
 
     def __enter__(self) -> SyncBridge:
@@ -98,19 +116,20 @@ class SyncBridge:
         self.close()
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        loop = self._loop
-        if loop is not None:
-            return loop
         with self._guard:
-            loop = self._loop
-            if loop is None:
-                loop = asyncio.new_event_loop()
-                thread = threading.Thread(
-                    target=_serve, args=(loop,), name=_THREAD_NAME, daemon=True
-                )
-                thread.start()
-                self._loop, self._thread = loop, thread
-            return loop
+            return self._ensure_loop_locked()
+
+    def _ensure_loop_locked(self) -> asyncio.AbstractEventLoop:
+        loop = self._loop
+        if loop is None:
+            loop = asyncio.new_event_loop()
+            # The thread holds the loop, never the bridge: dropped, the bridge is collected
+            # and its finalizer stops the loop, whose thread then ends.
+            thread = threading.Thread(target=_serve, args=(loop,), name=_THREAD_NAME, daemon=True)
+            thread.start()
+            self._loop, self._thread = loop, thread
+            self._finalizer = weakref.finalize(self, _stop, loop)
+        return loop
 
     def _forget_after_fork(self) -> None:
         # In the child the loop thread is gone and the guard may be held by a thread
@@ -118,6 +137,16 @@ class SyncBridge:
         # looks like it is running, and closing a running loop raises.
         self._guard = threading.Lock()
         self._loop = self._thread = None
+        if self._finalizer is not None:
+            self._finalizer.detach()  # the parent's loop is not this process's to stop
+            self._finalizer = None
+
+
+def _stop(loop: asyncio.AbstractEventLoop) -> None:
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        pass  # the loop already closed itself
 
 
 def _serve(loop: asyncio.AbstractEventLoop) -> None:

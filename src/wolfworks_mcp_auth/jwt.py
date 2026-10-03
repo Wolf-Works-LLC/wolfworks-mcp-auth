@@ -25,6 +25,9 @@ _REQUIRED_CLAIMS = ["exp", "iat", "sub"]
 # Anyone can send a token naming an unknown key id. It buys one refetch per
 # cooldown, not one each; PyJWT's own `PyJWKClient` uses the same 30 seconds.
 _REFETCH_COOLDOWN_SECONDS = 30
+# Discovery and the key set together, so a slow issuer counts as a failed fetch, and the
+# held keys answer, before a caller's own deadline: `run_sync` waits ten seconds.
+_FETCH_BUDGET_SECONDS = 5.0
 _MAX_MESSAGE_LENGTH = 300
 
 logger = logging.getLogger(__name__)
@@ -79,6 +82,7 @@ class WorkOSJWTVerifier:
         leeway_seconds: int = 60,
         cache_ttl_seconds: int = 300,
         max_stale_seconds: int = 86400,
+        fetch_budget_seconds: float = _FETCH_BUDGET_SECONDS,
         fetch_json: JsonFetcher = _fetch_json,
     ) -> None:
         if not issuer:
@@ -87,20 +91,24 @@ class WorkOSJWTVerifier:
             raise TypeError("audiences is a list of audiences, not one string")
         if not audiences or not all(audiences):
             raise ValueError("at least one non-empty audience is required")
+        if not fetch_budget_seconds > 0:
+            raise ValueError("fetch_budget_seconds must be positive")
         self._issuer = issuer.rstrip("/")
         self._audiences = list(audiences)
         self._jwks_url = jwks_url
         self._leeway = leeway_seconds
         self._ttl = cache_ttl_seconds
         self._max_stale = max_stale_seconds
+        self._fetch_budget = fetch_budget_seconds
         self._fetch_json = fetch_json
         self._keys: dict[str, PyJWK] = {}
         self._keys_fetched_at = 0.0
         self._refetched_at = float("-inf")
         self._failed_at = float("-inf")
-        # One lock per event loop: a lock made here would belong to whichever loop
-        # first contended for it, and a module-level verifier outlives its loop.
-        self._locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+        # The refresh in flight on each event loop. A task belongs to the loop that made
+        # it, and a module-level verifier outlives its loop and may serve several at once.
+        # Each loop's thread writes only its own entry, and nothing iterates the table.
+        self._refreshes: dict[asyncio.AbstractEventLoop, asyncio.Task[dict[str, PyJWK]]] = {}
 
     async def verify(self, token: str) -> dict[str, Any]:
         """Return the token's claims, or raise `JWTVerificationError`."""
@@ -160,39 +168,60 @@ class WorkOSJWTVerifier:
         return (time.monotonic() - self._keys_fetched_at) < self._ttl
 
     async def _load_keys(self, *, force: bool) -> dict[str, PyJWK]:
-        # Checked before the lock so a fetch in flight never stalls a cache hit,
-        # and again inside it because the request ahead may have just fetched.
+        # A cache hit never waits behind a fetch in flight.
         if self._cache_answers(force=force):
             return self._keys
-        async with self._lock():
-            if self._cache_answers(force=force):
-                return self._keys
+        loop = asyncio.get_running_loop()
+        refresh = self._refreshes.get(loop)
+        if refresh is None or refresh.done():
+            # Nothing awaits between here and the task's creation, so a loop runs at most
+            # one refresh at a time and everyone else on it waits for that one.
             if (time.monotonic() - self._failed_at) < _REFETCH_COOLDOWN_SECONDS:
                 # The last fetch failed moments ago: do not queue another behind it.
                 return self._held_keys_or_raise("backing off after a failed fetch")
             if force:
                 self._refetched_at = time.monotonic()
-            try:
+            refresh = self._start_refresh(loop)
+        # Shielded: a caller that gives up - a sync bridge's timeout cancels it - leaves
+        # the refresh running for everyone else, and its outcome is still recorded.
+        return await asyncio.shield(refresh)
+
+    def _start_refresh(self, loop: asyncio.AbstractEventLoop) -> asyncio.Task[dict[str, PyJWK]]:
+        refresh = loop.create_task(self._refresh())
+        self._refreshes[loop] = refresh
+
+        def finished(done: asyncio.Task[dict[str, PyJWK]]) -> None:
+            if self._refreshes.get(loop) is done:
+                self._refreshes.pop(loop, None)
+            if not done.cancelled():
+                done.exception()  # retrieved: a refusal nobody awaited is not logged again
+
+        refresh.add_done_callback(finished)
+        return refresh
+
+    async def _refresh(self) -> dict[str, PyJWK]:
+        try:
+            async with asyncio.timeout(self._fetch_budget):
                 url = self._jwks_url or await self._discover_jwks_url()
                 key_set = PyJWKSet.from_dict(await self._fetch_json(url))
-                keys = {key.key_id: key for key in key_set.keys if key.key_id}
-                if not keys:
-                    # `kid` is optional in a JWK. Holding nothing would skip every cooldown
-                    # below, and each request would then cost the issuer two fetches.
-                    raise ValueError("the JWKS publishes no key with a kid")
-            except Exception as exc:
-                self._failed_at = time.monotonic()
-                # `repr`, because a timeout's text is empty and its type is the whole reason.
-                try:
-                    held = self._held_keys_or_raise(repr(exc), cause=exc)
-                except JWTVerificationError:
-                    logger.error("JWKS refresh failed with no usable keys, refusing JWTs: %r", exc)
-                    raise
-                logger.warning("JWKS refresh failed, serving the cached keys: %r", exc)
-                return held
-            self._keys = keys
-            self._keys_fetched_at = time.monotonic()
-            return self._keys
+            keys = {key.key_id: key for key in key_set.keys if key.key_id}
+            if not keys:
+                # `kid` is optional in a JWK. Holding nothing would skip every cooldown
+                # below, and each request would then cost the issuer two fetches.
+                raise ValueError("the JWKS publishes no key with a kid")
+        except Exception as exc:
+            self._failed_at = time.monotonic()
+            # `repr`, because a timeout's text is empty and its type is the whole reason.
+            try:
+                held = self._held_keys_or_raise(repr(exc), cause=exc)
+            except JWTVerificationError:
+                logger.error("JWKS refresh failed with no usable keys, refusing JWTs: %r", exc)
+                raise
+            logger.warning("JWKS refresh failed, serving the cached keys: %r", exc)
+            return held
+        self._keys = keys
+        self._keys_fetched_at = time.monotonic()
+        return self._keys
 
     def _held_keys_or_raise(
         self, reason: str, *, cause: Exception | None = None
@@ -205,18 +234,6 @@ class WorkOSJWTVerifier:
         raise JWTVerificationError(
             f"JWKS unavailable: {reason}", reason="jwks_unavailable"
         ) from cause
-
-    def _lock(self) -> asyncio.Lock:
-        loop = asyncio.get_running_loop()
-        lock = self._locks.get(loop)
-        if lock is None:
-            # Threads that each run a loop share this table. So never iterate it live,
-            # and never replace it: a thread holding the old dict would lose its entry.
-            # A snapshot, `pop` and `setdefault` are each one atomic step.
-            for stale in [other for other in list(self._locks) if other.is_closed()]:
-                self._locks.pop(stale, None)
-            lock = self._locks.setdefault(loop, asyncio.Lock())
-        return lock
 
     async def _discover_jwks_url(self) -> str:
         document = await self._fetch_json(f"{self._issuer}/.well-known/openid-configuration")
