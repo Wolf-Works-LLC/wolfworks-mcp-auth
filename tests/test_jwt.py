@@ -487,3 +487,56 @@ def test_one_verifier_serves_two_event_loops(mint, jwks):
 
     assert len(asyncio.run(contend())) == 3
     assert len(asyncio.run(contend())) == 3
+
+
+async def test_a_lock_made_while_another_thread_changes_the_table_does_not_raise(fetcher):
+    # Another thread's loop adding its own lock mid-prune used to raise
+    # "dictionary changed size during iteration". Simulate exactly that, deterministically.
+    verifier = _verifier(fetcher)
+
+    class ClosedLoopWhoseCheckRacesAnotherThread:
+        def is_closed(self) -> bool:
+            verifier._locks[object()] = asyncio.Lock()  # what the other thread does
+            return True
+
+    verifier._locks[ClosedLoopWhoseCheckRacesAnotherThread()] = asyncio.Lock()
+    assert verifier._lock() is verifier._lock()
+
+
+def test_verifiers_shared_by_threads_each_running_their_own_loop(mint, jwks):
+    # The threaded-Flask shape the sync bridge replaces: `asyncio.run` per request.
+    import sys
+    import threading
+
+    verifier = WorkOSJWTVerifier(
+        issuer=ISSUER,
+        audiences=(RESOURCE,),
+        jwks_url="https://keys.test/jwks",
+        cache_ttl_seconds=0,  # every call takes the lock, so every loop makes one
+        fetch_json=lambda url: _resolved(jwks),
+    )
+    token, errors = mint(), []
+
+    def worker() -> None:
+        for _ in range(100):
+            try:
+                asyncio.run(verifier.verify(token))
+            except Exception as exc:  # every failure is the finding
+                errors.append(exc)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as possible
+    try:
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert not errors, errors[:3]
+    assert len(verifier._locks) <= 8  # a closed loop's lock is pruned, not hoarded
+
+
+async def _resolved(value):
+    return value

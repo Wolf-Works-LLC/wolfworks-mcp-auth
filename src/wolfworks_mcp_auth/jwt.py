@@ -210,8 +210,12 @@ class WorkOSJWTVerifier:
         loop = asyncio.get_running_loop()
         lock = self._locks.get(loop)
         if lock is None:
-            self._locks = {k: v for k, v in self._locks.items() if not k.is_closed()}
-            lock = self._locks[loop] = asyncio.Lock()
+            # Threads that each run a loop share this table. So never iterate it live,
+            # and never replace it: a thread holding the old dict would lose its entry.
+            # A snapshot, `pop` and `setdefault` are each one atomic step.
+            for stale in [other for other in list(self._locks) if other.is_closed()]:
+                self._locks.pop(stale, None)
+            lock = self._locks.setdefault(loop, asyncio.Lock())
         return lock
 
     async def _discover_jwks_url(self) -> str:

@@ -18,6 +18,7 @@ the three things it cannot know:
 | `WorkOSTokenVerifier` | the SDK `TokenVerifier` for WorkOS-issued JWTs, with an optional fallback for long-lived API tokens |
 | `IdentityGate` | a `ServerMiddleware` that runs *your* user lookup and turns its refusal into the one response shape the SDK can deliver |
 | `SurfaceTokenVerifier` | the same WorkOS check for a surface that is not MCP — a REST route, a socket, an ingest endpoint — bound to that surface's resource and to the clients it expects (0.2.0) |
+| `run_sync` / `SyncBridge` | one long-lived background event loop, so synchronous hosts such as Flask can call the async verifiers (0.2.0) |
 | `python -m wolfworks_mcp_auth.conformance <url>` | walks a server's discovery chain the way a client does |
 
 It names no host. Every URL is configuration you pass in.
@@ -215,6 +216,47 @@ Do not pass client IDs to `WorkOSJWTVerifier` as `audiences`. A WorkOS token
 requested without a `resource` carries the tenant's default application client
 ID as its `aud`, so a client-ID audience accepts tokens minted for anything.
 `audiences` takes resource URIs.
+
+### Calling a verifier from synchronous code (Flask)
+
+The verifiers are async. A synchronous host hands each call to one long-lived
+background event loop with `run_sync`, and never runs a loop per request:
+`asyncio.run` per call gives every request its own lock inside the verifier, so
+concurrent requests stop sharing one JWKS fetch, and each one pays for a new loop.
+
+```python
+from flask import Flask, abort, request
+from wolfworks_mcp_auth import SurfaceTokenRefused, SurfaceTokenVerifier, looks_like_jwt, run_sync
+
+app = Flask(__name__)
+api = SurfaceTokenVerifier(issuer=ISSUER, resource=API_RESOURCE, expected_clients=API_CLIENTS)
+
+
+def oauth_principal():
+    bearer = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not looks_like_jwt(bearer):
+        return None  # not a WorkOS token: your existing authentication, unchanged
+    try:
+        return run_sync(api.verify(bearer), timeout=10)
+    except SurfaceTokenRefused as refused:
+        # The issuer's outage is ours to answer, not the caller's: never 401 for it.
+        abort(503 if refused.reason == "jwks_unavailable" else 401)
+    except TimeoutError:
+        abort(503)  # the issuer was too slow; the token may be fine
+```
+
+`run_sync` is safe from any number of threads. The loop runs on one daemon
+thread, which starts on the first call, not on import. Under gunicorn, each
+worker starts its own on its first request: a forked child forgets the parent's
+loop, whose thread does not exist there, so `--preload` is safe too. To start
+the loop at worker boot instead, give the host its own `SyncBridge` and call its
+`start()` from gunicorn's `post_fork` hook.
+
+Every call waits at most `timeout` seconds (ten by default), then cancels the
+coroutine and raises `TimeoutError`. Calling `run_sync` from async code raises
+`RuntimeError`: `await` there instead. The loop is stopped cleanly at exit.
+`SyncBridge()` gives a host its own loop, with its own `default_timeout`, `close()`
+and context manager. Most hosts need only the shared one behind `run_sync`.
 
 ## What a refusal looks like
 
