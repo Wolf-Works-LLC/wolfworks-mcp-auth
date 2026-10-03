@@ -35,11 +35,16 @@ class JWTVerificationError(Exception):
 
     Safe because it is made so here: the libraries underneath echo parts of the
     token, which its sender wrote, so the text is cut to one bounded line.
+
+    `reason` is the same answer as a fixed word a caller can branch on:
+    `malformed`, `signature`, `issuer`, `audience`, `expired`, `claims`,
+    `jwks_unavailable` or `invalid`.
     """
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, reason: str = "invalid") -> None:
         one_line = "".join(c if c.isprintable() else " " for c in message)
         super().__init__(one_line[:_MAX_MESSAGE_LENGTH])
+        self.reason = reason
 
 
 def looks_like_jwt(token: str) -> bool:
@@ -58,8 +63,11 @@ class WorkOSJWTVerifier:
     """Checks signature, `iss`, `aud`, `exp`, `iat` and `sub`.
 
     `audiences` is an allow-list: a token passes when any of its `aud` values
-    is in it. An MCP server passes its one canonical resource URI; a REST path
-    passes the client IDs it accepts tokens from.
+    is in it. Pass resource URIs, never client IDs: a WorkOS token requested
+    without a `resource` carries the tenant's default application client ID as
+    its `aud`, so a client-ID audience accepts tokens minted for anything. An MCP
+    server passes its one canonical resource URI; any other surface uses
+    `SurfaceTokenVerifier`, which also requires an expected `client_id`.
     """
 
     def __init__(
@@ -102,7 +110,7 @@ class WorkOSJWTVerifier:
         try:
             kid = jwt.get_unverified_header(token).get("kid")
         except Exception as exc:
-            raise JWTVerificationError(f"malformed token: {exc}") from exc
+            raise JWTVerificationError(f"malformed token: {exc}", reason="malformed") from exc
 
         key = await self._signing_key(kid)
         try:
@@ -116,13 +124,20 @@ class WorkOSJWTVerifier:
                 options={"require": _REQUIRED_CLAIMS},
             )
         except jwt.ExpiredSignatureError as exc:
-            raise JWTVerificationError("token expired") from exc
+            raise JWTVerificationError("token expired", reason="expired") from exc
         except jwt.InvalidIssuerError as exc:
-            raise JWTVerificationError("issuer mismatch") from exc
+            raise JWTVerificationError("issuer mismatch", reason="issuer") from exc
         except (jwt.InvalidAudienceError, jwt.MissingRequiredClaimError) as exc:
-            raise JWTVerificationError(f"audience or required claim rejected: {exc}") from exc
+            missing = isinstance(exc, jwt.MissingRequiredClaimError) and exc.claim != "aud"
+            raise JWTVerificationError(
+                f"audience or required claim rejected: {exc}",
+                reason="claims" if missing else "audience",
+            ) from exc
         except jwt.InvalidSignatureError as exc:
-            raise JWTVerificationError("signature verification failed") from exc
+            raise JWTVerificationError("signature verification failed", reason="signature") from exc
+        except jwt.InvalidAlgorithmError as exc:
+            # A token in an algorithm we do not accept carries no signature we can check.
+            raise JWTVerificationError(f"token rejected: {exc}", reason="signature") from exc
         except Exception as exc:
             raise JWTVerificationError(f"token rejected: {exc}") from exc
 
@@ -132,7 +147,9 @@ class WorkOSJWTVerifier:
             # An unknown key id usually means the issuer rotated its keys.
             keys = await self._load_keys(force=True)
         if kid not in keys:
-            raise JWTVerificationError(f"no signing key published for kid {kid!r}")
+            raise JWTVerificationError(
+                f"no signing key published for kid {kid!r}", reason="signature"
+            )
         return keys[kid]
 
     def _cache_answers(self, *, force: bool) -> bool:
@@ -185,7 +202,9 @@ class WorkOSJWTVerifier:
         age = time.monotonic() - self._keys_fetched_at
         if self._keys and age < self._max_stale:
             return self._keys
-        raise JWTVerificationError(f"JWKS unavailable: {reason}") from cause
+        raise JWTVerificationError(
+            f"JWKS unavailable: {reason}", reason="jwks_unavailable"
+        ) from cause
 
     def _lock(self) -> asyncio.Lock:
         loop = asyncio.get_running_loop()

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wolfworks-mcp-auth"
-version = "0.1.0"
+version = "0.2.0"
 description = "WorkOS token verification and an identity gate for MCP servers built on the official mcp SDK."
 readme = "README.md"
 license = "MIT"

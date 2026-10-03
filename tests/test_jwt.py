@@ -83,6 +83,24 @@ async def test_rejects_token_missing_a_required_claim(mint, fetcher, claim):
         await _verifier(fetcher).verify(mint(drop=(claim,)))
 
 
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"drop": ("aud",)}, "audience"),
+        ({"aud": "https://other.test/mcp"}, "audience"),
+        ({"drop": ("sub",)}, "claims"),
+        ({"iss": "https://evil.test"}, "issuer"),
+        ({"exp": 1, "iat": 0}, "expired"),
+        ({"algorithm": "RS384"}, "signature"),
+        ({"kid": "never-published"}, "signature"),
+    ],
+)
+async def test_every_refusal_names_its_reason(mint, fetcher, overrides, reason):
+    with pytest.raises(JWTVerificationError) as raised:
+        await _verifier(fetcher).verify(mint(**overrides))
+    assert raised.value.reason == reason
+
+
 async def test_rejects_signature_from_another_key(mint, fetcher, other_key):
     with pytest.raises(JWTVerificationError, match="signature"):
         await _verifier(fetcher).verify(mint(key=other_key))

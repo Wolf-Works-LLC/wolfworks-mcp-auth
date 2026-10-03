@@ -17,6 +17,7 @@ the three things it cannot know:
 |---|---|
 | `WorkOSTokenVerifier` | the SDK `TokenVerifier` for WorkOS-issued JWTs, with an optional fallback for long-lived API tokens |
 | `IdentityGate` | a `ServerMiddleware` that runs *your* user lookup and turns its refusal into the one response shape the SDK can deliver |
+| `SurfaceTokenVerifier` | the same WorkOS check for a surface that is not MCP — a REST route, a socket, an ingest endpoint — bound to that surface's resource and to the clients it expects (0.2.0) |
 | `python -m wolfworks_mcp_auth.conformance <url>` | walks a server's discovery chain the way a client does |
 
 It names no host. Every URL is configuration you pass in.
@@ -157,18 +158,54 @@ One `streamable_http_app()` serves one lifespan: entering it a second time
 raises `RuntimeError`. If your tests build the host more than once, build
 `mcp_app` inside the same factory.
 
-### Verifying a WorkOS token outside MCP
+### Accepting a WorkOS token on a surface that is not MCP
+
+Nothing else here verifies a WorkOS token outside `/mcp`, and nothing should
+until it is bound twice: to the surface's own resource, and to the clients that
+surface expects.
 
 ```python
-from wolfworks_mcp_auth import JWTVerificationError, WorkOSJWTVerifier
+from wolfworks_mcp_auth import SurfaceTokenRefused, SurfaceTokenVerifier
 
-verifier = WorkOSJWTVerifier(issuer=ISSUER, audiences=[MY_OAUTH_APPLICATION_CLIENT_ID])
-claims = await verifier.verify(bearer)  # raises JWTVerificationError
+ingest = SurfaceTokenVerifier(
+    issuer=ISSUER,
+    resource=os.environ["INGEST_RESOURCE"],  # this surface's RFC 8707 resource
+    expected_clients={
+        os.environ["PIPELINE_CLIENT_ID"]: "service",  # client credentials
+        os.environ["AGENT_CLIENT_ID"]: "device",  # device grant
+    },
+)
+
+try:
+    accepted = await ingest.verify(bearer)
+except SurfaceTokenRefused as refused:
+    log.info("refused: %s", refused.reason)  # e.g. "audience", "client_unexpected"
+    return 401
+
+accepted.kind  # "user" | "service" | "device": what you configured, never guessed
+accepted.subject  # the WorkOS `sub`; map it to your own principal
+accepted.client_id
+accepted.claims
 ```
 
-`audiences` is an allow-list. Bind every path to the client it expects tokens
-from: a tenant with open client registration issues genuine tokens to clients
-you have never heard of.
+It accepts a token only when its signature, issuer and expiry are valid, its
+`aud` contains `resource`, and its `client_id` claim is a key of
+`expected_clients`. A token with no `client_id` is refused (`client_id_missing`):
+unlike `WorkOSTokenVerifier`, it never falls back to `azp` or `sub`. A client the
+surface does not list is refused (`client_unexpected`): a tenant with open client
+registration issues genuine tokens, for any registered resource, to clients you
+have never heard of. A first-party User Management token is refused on its
+issuer, and a `/user_management/` issuer cannot be configured.
+
+`SurfaceTokenRefused` is a `JWTVerificationError`. Its `reason` is one of
+`client_id_missing`, `client_unexpected`, `audience`, `issuer`, `expired`,
+`signature`, `malformed`, `claims`, `jwks_unavailable` or `invalid`; its message
+is safe to log.
+
+Do not pass client IDs to `WorkOSJWTVerifier` as `audiences`. A WorkOS token
+requested without a `resource` carries the tenant's default application client
+ID as its `aud`, so a client-ID audience accepts tokens minted for anything.
+`audiences` takes resource URIs.
 
 ## What a refusal looks like
 
