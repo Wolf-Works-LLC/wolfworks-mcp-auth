@@ -1,5 +1,5 @@
 {
-  "version": "v1",
+  "version": "v2",
   "repositories": {
     "Wolf-Works-LLC/wolfworks-mcp-auth": {
       "delivery": "vendored",
