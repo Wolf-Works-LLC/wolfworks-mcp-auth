@@ -1,0 +1,10 @@
+{
+  "version": "v1",
+  "repositories": {
+    "Wolf-Works-LLC/wolfworks-mcp-auth": {
+      "delivery": "vendored",
+      "default_branch": "main",
+      "deployments": []
+    }
+  }
+}
